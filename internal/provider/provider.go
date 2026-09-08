@@ -1,22 +1,30 @@
 // Package provider holds the provider type, its configuration schema, and every
 // resource and data source (one per file).
 //
-// SCAFFOLD (SCAFFOLD-PROVIDER-MODULE): this file establishes the provider type
-// and the configuration surface of terraform-provider-contract.md §2.1/§2.2 so
-// that the toolchain is provably working. Configure() deliberately does no work
-// beyond publishing the parsed configuration: the credential chain (§2.4), the
-// capabilities pre-flight and the HTTP client (§2.5) belong to
-// AUTH-PROVIDER-CREDENTIAL-CHAIN and the provider-client items, not here.
+// Configure implements terraform-provider-contract.md §2.5: it resolves the
+// configuration (§2.1, §2.4), builds the HTTP client with the redirect and
+// content-type rules, makes the ONE /v1/capabilities call, and runs the
+// negotiation and instance-pinning assertions of §3 — all before any resource is
+// touched.
 package provider
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"regexp"
+	"runtime"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
+	"github.com/mantisec/terraform-provider-azureacme/internal/client"
 )
 
 // ProviderTypeName is the local name Terraform gives this provider, and therefore
@@ -33,6 +41,18 @@ var (
 
 type azureACMEProvider struct {
 	version string
+	// tokenSource is an injection point for tests. Production leaves it nil and
+	// the credential SELECTION of §2.4 applies.
+	tokenSource client.TokenSource
+}
+
+// NewWithTokenSource builds a provider that authenticates with a supplied token
+// source. It exists for the acceptance suite, which drives a real
+// `terraform plan` against the in-process fake service.
+func NewWithTokenSource(version string, tokens client.TokenSource) func() provider.Provider {
+	return func() provider.Provider {
+		return &azureACMEProvider{version: version, tokenSource: tokens}
+	}
 }
 
 // New returns the provider constructor consumed by providerserver.Serve.
@@ -122,20 +142,145 @@ func (p *azureACMEProvider) Configure(ctx context.Context, req provider.Configur
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	// SCAFFOLD: no client is built and no credential is acquired yet. The
-	// unknown-endpoint diagnostic (§2.5 step 1), the credential chain (§2.4) and
-	// the capabilities pre-flight are owned by their own backlog items.
-	resp.DataSourceData = &cfg
-	resp.ResourceData = &cfg
+
+	// §2.3: there is no `client_secret` HCL attribute, because provider
+	// configuration IS captured in saved plan files, which CI systems routinely
+	// archive. The environment variable is accepted for compatibility and warned
+	// about.
+	if os.Getenv("ARM_CLIENT_SECRET") != "" {
+		resp.Diagnostics.AddWarning("Authenticating with a client secret from the environment ("+DiagClientSecretFromEnvironment+")",
+			"`ARM_CLIENT_SECRET` is set. Client secrets are accepted for compatibility and are DISCOURAGED: prefer workload "+
+				"identity federation (`use_oidc`) or a managed identity, neither of which puts a long-lived secret on a "+
+				"CI runner.\n\nThere is deliberately no `client_secret` provider attribute: provider configuration is "+
+				"captured in saved plan files (`terraform plan -out`), which CI systems routinely archive.")
+	}
+
+	resolved := resolveConfig(ctx, cfg, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	tokens := p.tokenSource
+	if tokens == nil {
+		tokens = buildTokenSource(resolved.CredentialMethod, resolved.Audience)
+	}
+
+	terraformVersion := req.TerraformVersion
+	if terraformVersion == "" {
+		terraformVersion = "unknown"
+	}
+	apiClient, err := client.New(client.Config{
+		Endpoint: resolved.Endpoint,
+		Audience: resolved.Audience,
+		Tokens:   tokens,
+		// The service's minimum_client_version enforcement and its
+		// client.version_observed telemetry key on this string.
+		UserAgent: fmt.Sprintf("terraform-provider-azureacme/%s (+terraform/%s) Go/%s",
+			p.version, terraformVersion, runtime.Version()),
+		RequestTimeout: resolved.RequestTimeout,
+		MaxRetries:     resolved.MaxRetries,
+	})
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Could not build the service client", err.Error())
+		return
+	}
+
+	// tflog masking. TF_LOG=TRACE MUST NOT print a token.
+	ctx = tflog.MaskFieldValuesWithFieldKeys(ctx, "authorization", "Authorization", "token", "oidc_token", "client_secret")
+	ctx = tflog.MaskAllFieldValuesRegexes(ctx, bearerTokenPattern)
+
+	data := &providerData{
+		Client:            apiClient,
+		Environment:       resolved.Environment,
+		SkipVersionCheck:  resolved.SkipVersionCheck,
+		SkipInstanceCheck: resolved.SkipInstanceCheck,
+	}
+
+	// ONE capabilities call, cached for the provider's lifetime (§3.1), so
+	// plan-time validation costs no extra API calls.
+	caps, _, err := apiClient.GetCapabilities(ctx)
+	if err != nil {
+		addCapabilitiesError(&resp.Diagnostics, apiClient, err)
+		return
+	}
+	data.Capabilities = caps
+	negotiateCapabilities(ctx, data, p.version, resolved.ExpectedServiceInstanceID, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.DataSourceData = data
+	resp.ResourceData = data
 }
 
-// Resources is empty by design in this item — SCAFFOLD-PROVIDER-MODULE ships no
-// resource. `azureacme_certificate` is the provider-domain items' work.
+// bearerTokenPattern masks anything that looks like a bearer token in a log line.
+var bearerTokenPattern = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*`)
+
+func addCapabilitiesError(diags *diag.Diagnostics, c *client.Client, err error) {
+	if tErr, ok := client.AsTransportError(err); ok {
+		switch tErr.Reason {
+		case client.ReasonRedirect:
+			diags.AddError("The endpoint redirected instead of answering",
+				fmt.Sprintf("%s returned HTTP %d to %q when asked for its capabilities.\n\n"+
+					"The provider never follows redirects: Easy Auth's default for an unauthenticated request is a "+
+					"redirect to an interactive sign-in page, and following it would turn an authentication failure into "+
+					"an HTML 200.\n\nConfigure the service with `unauthenticatedClientAction = Return401` and no "+
+					"`redirectToProvider`.", c.Endpoint(), tErr.Status, tErr.Location))
+			return
+		case client.ReasonContentType:
+			diags.AddError("The endpoint is not the certificate service API",
+				fmt.Sprintf("%s answered with %s rather than JSON — it is probably an authentication portal or an "+
+					"unrelated service.\n\nCheck `endpoint`.", c.Endpoint(), tErr.ContentType))
+			return
+		}
+	}
+	if apiErr, ok := client.AsAPIError(err); ok {
+		diags.AddError(fmt.Sprintf("Could not read the service capabilities (HTTP %d)", apiErr.Status),
+			fmt.Sprintf("%s\n\nCredential method: %q.\n\n%s\n\nRequest id: %s",
+				apiErr.Title(), c.CredentialMethod(), nextActionLine(apiErr), apiErr.RequestID()))
+		return
+	}
+	diags.AddError("Could not reach the certificate service",
+		fmt.Sprintf("%v\n\nEndpoint: %s\nCredential method: %q", err, c.Endpoint(), c.CredentialMethod()))
+}
+
+// ReservedResourceTypeNames are the four POLICY-PLANE resource type names
+// reserved by §1.3 pending decision D-19.
+//
+// PROVISIONAL(D-19): taken as branch (a) — policy is authored ONLY by the
+// platform Terraform pipeline, the API has no policy write path, and these four
+// resources are NEVER BUILT. The names are reserved anyway so that if D-19 is
+// ever reopened as (b) or (c) the change is ADDITIVE rather than breaking.
+//
+// Terraform keeps resource and data-source type names in separate namespaces, so
+// the `azureacme_namespace` DATA SOURCE and a future `azureacme_namespace`
+// RESOURCE can coexist. Reserving them therefore costs nothing today.
+//
+// TestReservedResourceTypeNamesAreNotRegistered asserts no resource claims one.
+var ReservedResourceTypeNames = []string{
+	"azureacme_namespace",
+	"azureacme_dns_binding",
+	"azureacme_destination_policy",
+	"azureacme_role_binding",
+}
+
+// Resources returns every managed resource. `azureacme_certificate` is the ONLY
+// resource in v1.
 func (p *azureACMEProvider) Resources(_ context.Context) []func() resource.Resource {
-	return nil
+	return []func() resource.Resource{
+		NewCertificateResource,
+	}
 }
 
-// DataSources is empty by design in this item.
+// DataSources returns the six read-only data sources of §1.2. They are identical
+// under all three branches of D-19, so none of them is blocked by it.
 func (p *azureACMEProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return nil
+	return []func() datasource.DataSource{
+		NewServiceDataSource,
+		NewCertificateDataSource,
+		NewCertificatesDataSource,
+		NewNamespaceDataSource,
+		NewValidationBindingDataSource,
+		NewValidationBindingsDataSource,
+	}
 }

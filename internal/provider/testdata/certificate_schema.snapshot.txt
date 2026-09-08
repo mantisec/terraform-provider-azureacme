@@ -1,0 +1,60 @@
+acknowledge_irreversible_delete                type=basetypes.BoolType           mode=Optional+Computed default=false
+acme_profile                                   type=basetypes.StringType         mode=Optional+Computed default="default"
+certificate_name                               type=basetypes.StringType         mode=Optional
+common_name                                    type=basetypes.StringType         mode=Optional
+consumer_profile                               type=basetypes.StringType         mode=Optional
+current_certificate                            type=basetypes.ObjectType         mode=Computed
+current_certificate.acme_profile               type=basetypes.StringType         mode=Computed
+current_certificate.issued_at                  type=rfc3339.StringType           mode=Computed
+current_certificate.issuer                     type=basetypes.StringType         mode=Computed
+current_certificate.not_after                  type=rfc3339.StringType           mode=Computed
+current_certificate.not_before                 type=rfc3339.StringType           mode=Computed
+current_certificate.published_at               type=rfc3339.StringType           mode=Computed
+current_certificate.serial_number              type=basetypes.StringType         mode=Computed
+current_certificate.thumbprint_sha256          type=basetypes.StringType         mode=Computed
+current_certificate.version_certificate_id     type=basetypes.StringType         mode=Computed
+current_certificate.version_secret_id          type=basetypes.StringType         mode=Computed
+deletion_policy                                type=basetypes.StringType         mode=Optional+Computed default="retain"
+description                                    type=basetypes.StringType         mode=Optional
+destination_id                                 type=basetypes.StringType         mode=Optional
+dns_names                                      type=basetypes.SetType            mode=Required
+fulfilled_generation                           type=basetypes.Int64Type          mode=Computed
+generation                                     type=basetypes.Int64Type          mode=Computed
+id                                             type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+key                                            type=basetypes.ObjectType         mode=Optional+Computed default={"algorithm":"RSA","curve":<null>,"exportable":true,"size":2048}
+key.algorithm                                  type=basetypes.StringType         mode=Optional+Computed default="RSA"
+key.curve                                      type=basetypes.StringType         mode=Optional
+key.exportable                                 type=basetypes.BoolType           mode=Optional+Computed default=true
+key.size                                       type=basetypes.Int64Type          mode=Optional+Computed default=2048
+key_vault_id                                   type=armid.StringType             mode=Required
+labels                                         type=basetypes.MapType            mode=Optional
+last_successful_renewal_at                     type=rfc3339.StringType           mode=Computed
+name                                           type=basetypes.StringType         mode=Required modifiers=[requiresReplaceIf]
+namespace                                      type=basetypes.StringType         mode=Required modifiers=[requiresReplaceIf]
+publication_mode                               type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+registration_id                                type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+renewal                                        type=basetypes.ObjectType         mode=Optional+Computed default={"mode":"automatic","use_ari":true}
+renewal.mode                                   type=basetypes.StringType         mode=Optional+Computed default="automatic"
+renewal.use_ari                                type=basetypes.BoolType           mode=Optional+Computed default=true
+resolved_acme_profile                          type=basetypes.StringType         mode=Computed
+resolved_certificate_name                      type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+resolved_validation_binding                    type=basetypes.StringType         mode=Computed
+service_instance_id                            type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+spec_revision                                  type=basetypes.Int64Type          mode=Computed
+timeouts                                       type=Block(SingleNested)          mode=
+timeouts.create                                type=basetypes.StringType         mode=Optional
+timeouts.delete                                type=basetypes.StringType         mode=Optional
+timeouts.read                                  type=basetypes.StringType         mode=Optional
+timeouts.update                                type=basetypes.StringType         mode=Optional
+validation_binding                             type=basetypes.StringType         mode=Optional+Computed default="auto"
+verification                                   type=basetypes.ObjectType         mode=Optional
+verification.consumer_probe                    type=basetypes.ObjectType         mode=Optional
+verification.consumer_probe.enabled            type=basetypes.BoolType           mode=Optional+Computed default=false
+verification.consumer_probe.endpoints          type=basetypes.ListType           mode=Optional
+verification.consumer_probe.endpoints.host     type=basetypes.StringType         mode=Required
+verification.consumer_probe.endpoints.port     type=basetypes.Int64Type          mode=Optional+Computed default=443
+verification.consumer_probe.endpoints.sni      type=basetypes.StringType         mode=Optional
+verification.consumer_probe.expected_pickup    type=basetypes.StringType         mode=Optional
+versionless_certificate_id                     type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+versionless_secret_id                          type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+wait_for                                       type=basetypes.StringType         mode=Optional+Computed default="published"
