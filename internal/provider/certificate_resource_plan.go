@@ -194,8 +194,7 @@ func destinationChangeDiagnostics(state, plan certificateResourceModel, migratio
 	if !plan.CertificateName.IsUnknown() && state.effectiveCertificateName() != plan.effectiveCertificateName() {
 		changes = append(changes, change{"certificate_name", state.effectiveCertificateName(), plan.effectiveCertificateName()})
 	}
-	if !plan.DestinationID.IsUnknown() && !state.DestinationID.Equal(plan.DestinationID) &&
-		!(state.DestinationID.IsNull() && plan.DestinationID.IsNull()) {
+	if destinationIDMoves(state, plan) {
 		changes = append(changes, change{"destination_id", state.DestinationID.ValueString(), plan.DestinationID.ValueString()})
 	}
 	if len(changes) == 0 {
@@ -203,7 +202,16 @@ func destinationChangeDiagnostics(state, plan certificateResourceModel, migratio
 	}
 	first := changes[0]
 	var b strings.Builder
-	fmt.Fprintf(&b, "  To unblock planning, revert `%s` to\n  %q.\n\n", first.attribute, first.was)
+	if first.was == "" {
+		// A destination attribute that was NOT SET before. "revert to \"\"" is not
+		// an instruction anyone can follow, and this message is the only thing
+		// standing between the reader and an unplannable workspace, so it leads
+		// with the edit that actually unblocks them: delete the line.
+		fmt.Fprintf(&b, "  To unblock planning, REMOVE `%s` from this resource; it was not set before this change.\n\n",
+			first.attribute)
+	} else {
+		fmt.Fprintf(&b, "  To unblock planning, revert `%s` to\n  %q.\n\n", first.attribute, first.was)
+	}
 	if len(changes) > 1 {
 		b.WriteString("  Other changed destination attributes: ")
 		for i, c := range changes[1:] {
@@ -227,6 +235,49 @@ func destinationChangeDiagnostics(state, plan certificateResourceModel, migratio
 	diags.AddAttributeError(path.Root(first.attribute),
 		"Changing the destination of an existing certificate registration is not supported", b.String())
 	return diags
+}
+
+// destinationIDMoves answers the only question §6.2.1 actually cares about for
+// `destination_id`: does this edit MOVE the certificate to a different
+// destination policy?
+//
+// PROVISIONAL(D-20) makes the destination server-resolved, so three of the four
+// transitions are not moves and must not abort the plan:
+//
+//   - null → null: nothing asserted, nothing changed.
+//   - value → null: the user STOPS asserting a policy. The service goes on
+//     resolving the same vault to the same policy, so nothing moves. Treating
+//     this as a move would make `destination_id` impossible to delete once
+//     written — the §5.3.1 trap re-entering through ModifyPlan rather than
+//     through the schema.
+//   - null → the policy the server already resolved: the user STARTS asserting
+//     the status quo, which is the single most likely first edit after reading
+//     `resolved_destination_id`. Refusing it would make adding the attribute
+//     abort the workspace for a change that moves nothing.
+//
+// Only an assertion that names a DIFFERENT policy from the one in effect is a
+// move, and that is the case the §6.2.1 error is for.
+func destinationIDMoves(state, plan certificateResourceModel) bool {
+	if plan.DestinationID.IsUnknown() {
+		return false
+	}
+	if plan.DestinationID.IsNull() {
+		return false
+	}
+	proposed := plan.DestinationID.ValueString()
+	if !state.DestinationID.IsNull() && !state.DestinationID.IsUnknown() {
+		return proposed != state.DestinationID.ValueString()
+	}
+	// Nothing was asserted before. The server's resolved policy is the value in
+	// effect, so asserting it is a no-op and asserting anything else is a move.
+	if state.ResolvedDestinationID.IsNull() || state.ResolvedDestinationID.IsUnknown() {
+		// Nothing to compare against (an older state, or an import that has not
+		// refreshed). Do not abort the whole plan on a value that may well be
+		// correct; the service rejects a mismatched assertion at apply with a
+		// field error on `spec.destination.destination_id`.
+		return false
+	}
+	return proposed != state.ResolvedDestinationID.ValueString()
 }
 
 func (r *certificateResource) warnConsumerInServiceOnDestroy(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {

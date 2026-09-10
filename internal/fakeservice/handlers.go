@@ -175,7 +175,7 @@ func (s *Server) handleGetNamespace(w http.ResponseWriter, name string) {
 		AllowedDeletionPolicies:      []contracts.DeletionPolicy{contracts.DeletionPolicyRetain, contracts.DeletionPolicyDelete},
 		AllowedKeyPolicies:           []contracts.AllowedKeyPolicy{{Algorithm: "RSA", Sizes: []int64{2048, 3072, 4096}}},
 		PermittedDomains:             []contracts.DomainRuleView{{Base: "example.com", Kind: "subtree", MaxLabelsBelow: ptr(int64(2))}},
-		PermittedDestinations:        []contracts.DestinationPolicyView{{DestinationID: "payments", KeyVaultID: DefaultKeyVaultID}},
+		PermittedDestinations:        s.permittedDestinationsLocked(),
 		WildcardPolicy:               map[string]json.RawMessage{"allowed": json.RawMessage("false")},
 	}
 	writeJSON(w, http.StatusOK, detail, nil)
@@ -303,6 +303,11 @@ func (s *Server) handlePutRegistration(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 	incoming := envelope.Spec
+	// PROVISIONAL(D-20): `destination_id` is optional, and when supplied it MUST
+	// match the policy the vault resolves to or the request is rejected.
+	if s.rejectMismatchedDestinationIDLocked(w, incoming) {
+		return
+	}
 	newHash := issuanceHash(incoming)
 
 	existing, exists := s.registrations[key(namespace, name)]
@@ -354,8 +359,19 @@ func (s *Server) handlePutRegistration(w http.ResponseWriter, r *http.Request, n
 	previousHash := reg.Spec.Hash
 	previousRevision := reg.Spec.Revision
 	previousGeneration := reg.Spec.Generation
+	// G-8: on an UPDATE an omitted field inherits the stored value, so the spec
+	// being replaced has to be kept until normalisation has read it.
+	var previousSpec *contracts.CertificateSpecRead
+	if exists {
+		stored := reg.Spec
+		previousSpec = &stored
+	}
 
 	reg.Spec = specReadFrom(incoming)
+	// THE FAKE NORMALISES, IT DOES NOT ECHO. See normalise.go: this is the line
+	// whose absence let eleven green acceptance tests coexist with a `terraform
+	// plan` that aborted the whole workspace.
+	s.normaliseSpecLocked(reg, previousSpec)
 	reg.Spec.Hash = newHash
 	reg.Spec.Revision = previousRevision + 1
 	reg.Spec.Generation = previousGeneration

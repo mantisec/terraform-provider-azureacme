@@ -159,6 +159,13 @@ func WithNextAction(next string) ProblemOption {
 	return func(p *contracts.Problem) { p.NextAction = next }
 }
 
+// WithFieldErrors attaches per-field subproblems, so a rejection can be asserted
+// to land on the right line of HCL through the §5.5 wire-path map rather than as
+// a resource-level error.
+func WithFieldErrors(errs ...contracts.ProblemFieldError) ProblemOption {
+	return func(p *contracts.Problem) { p.Errors = append(p.Errors, errs...) }
+}
+
 // WithRawCode sets a code string that need not exist in the taxonomy — used to
 // prove an UNKNOWN code still renders next_action and request_id verbatim.
 func WithRawCode(code string) ProblemOption {

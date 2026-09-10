@@ -129,6 +129,11 @@ func (s *Server) SeedRegistration(seed RegistrationSeed) *Registration {
 		},
 	}
 	s.registrations[key(seed.Namespace, seed.Name)] = reg
+	// A seeded registration is stored the way a WRITTEN one is: server-resolved
+	// destination id, materialised verification block. A seed that looked like
+	// the caller's bytes would make every Read test assert against a shape the
+	// real service never returns (normalise.go).
+	s.normaliseSpecLocked(reg, nil)
 	s.refreshResolvedLocked(reg)
 	if !seed.Unpublished {
 		s.issueCertificateLocked(reg)

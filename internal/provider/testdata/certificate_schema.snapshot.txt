@@ -38,6 +38,7 @@ renewal.mode                                   type=basetypes.StringType        
 renewal.use_ari                                type=basetypes.BoolType           mode=Optional+Computed default=true
 resolved_acme_profile                          type=basetypes.StringType         mode=Computed
 resolved_certificate_name                      type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
+resolved_destination_id                        type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
 resolved_validation_binding                    type=basetypes.StringType         mode=Computed
 service_instance_id                            type=basetypes.StringType         mode=Computed modifiers=[useStateForUnknown]
 spec_revision                                  type=basetypes.Int64Type          mode=Computed

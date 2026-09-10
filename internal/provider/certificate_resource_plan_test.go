@@ -487,3 +487,89 @@ func stateOf(t *testing.T, ctx context.Context, m certificateResourceModel) tfsd
 	}
 	return st
 }
+
+// TestDestinationIDMoves enumerates §6.2.1 for `destination_id` under
+// PROVISIONAL(D-20)'s server-resolved destination.
+//
+// A `ModifyPlan` error aborts the WHOLE plan, so every false positive here makes a
+// workspace unplannable for every resource in it and for every colleague until
+// someone edits the HCL. Three of the four transitions move nothing, and only an
+// assertion naming a DIFFERENT policy from the one in effect is a move.
+func TestDestinationIDMoves(t *testing.T) {
+	t.Parallel()
+	model := func(configured, resolved string) certificateResourceModel {
+		m := certificateResourceModel{
+			DestinationID:         types.StringNull(),
+			ResolvedDestinationID: types.StringNull(),
+		}
+		if configured != "" {
+			m.DestinationID = types.StringValue(configured)
+		}
+		if resolved != "" {
+			m.ResolvedDestinationID = types.StringValue(resolved)
+		}
+		return m
+	}
+	for _, tc := range []struct {
+		name        string
+		state, plan certificateResourceModel
+		want        bool
+		why         string
+	}{
+		{
+			name:  "nothing asserted, nothing asserted",
+			state: model("", "payments"), plan: model("", ""),
+			want: false,
+		},
+		{
+			name:  "the assertion is DELETED",
+			state: model("payments", "payments"), plan: model("", ""),
+			want: false,
+			why: "the user stops asserting; the service resolves the same vault to the same policy, so nothing moves. " +
+				"Calling this a move makes the attribute impossible to delete once written — the §5.3.1 trap " +
+				"re-entering through ModifyPlan",
+		},
+		{
+			name:  "the assertion is ADDED, naming the policy already in effect",
+			state: model("", "payments"), plan: model("payments", ""),
+			want: false,
+			why: "the most likely first edit after reading `resolved_destination_id`, and it moves nothing — refusing " +
+				"it would abort the workspace for a no-op",
+		},
+		{
+			name:  "the assertion is ADDED, naming a DIFFERENT policy",
+			state: model("", "payments"), plan: model("payments-v2", ""),
+			want: true,
+			why:  "this is the case the §6.2.1 error exists for",
+		},
+		{
+			name:  "the assertion CHANGES",
+			state: model("payments", "payments"), plan: model("payments-v2", ""),
+			want: true,
+		},
+		{
+			name:  "the assertion is unchanged",
+			state: model("payments", "payments"), plan: model("payments", ""),
+			want: false,
+		},
+		{
+			name:  "added, with no resolved value to compare against",
+			state: model("", ""), plan: model("payments", ""),
+			want: false,
+			why: "an older state, or an import that has not refreshed. Aborting the whole plan on a value that may " +
+				"well be right is worse than letting the service reject it with a field error",
+		},
+		{
+			name:  "the planned value is unknown",
+			state: model("payments", "payments"), plan: certificateResourceModel{DestinationID: types.StringUnknown()},
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := destinationIDMoves(tc.state, tc.plan); got != tc.want {
+				t.Errorf("destinationIDMoves = %v, want %v. %s", got, tc.want, tc.why)
+			}
+		})
+	}
+}

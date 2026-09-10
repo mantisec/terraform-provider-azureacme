@@ -133,6 +133,12 @@ func (r *certificateResource) Create(ctx context.Context, req resource.CreateReq
 	partial.ResolvedValidationBinding = stringOrNull(reg.Status.ResolvedValidationBinding)
 	partial.ResolvedCertificateName = stringOrNull(reg.Status.ResolvedCertificateName)
 	partial.PublicationMode = stringOrNull(reg.Status.PublicationMode)
+	// Every Computed attribute must be KNOWN here: partial state is written
+	// mid-apply and an unknown in state is not a legal value.
+	partial.ResolvedDestinationID = types.StringNull()
+	if reg.Spec.Destination != nil {
+		partial.ResolvedDestinationID = stringOrNull(reg.Spec.Destination.DestinationID)
+	}
 	partial.VersionlessSecretID = types.StringNull()
 	partial.VersionlessCertificateID = types.StringNull()
 	partial.LastSuccessfulRenewalAt = rfc3339.NewNull()

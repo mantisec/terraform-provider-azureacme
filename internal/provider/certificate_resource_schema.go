@@ -235,13 +235,36 @@ func certificateResourceSchema() schema.Schema {
 				// SERVER policy, never by the schema, so the stricter branch stays
 				// additive — making a Terraform attribute Required after publication
 				// would be breaking.
+				//
+				// Optional WITHOUT Computed, for the same reason as
+				// `certificate_name` (§5.2) and under the same rule (§5.3.1). The
+				// service RESOLVES this value server-side and returns it whether or
+				// not the caller sent one. Making the attribute `Optional + Computed`
+				// to absorb that would store the resolved policy id as though the
+				// user had written it, and then deleting the line could never revert
+				// it — which is §5.3.1's "worst during a platform migration" case
+				// verbatim: the platform team repoints the namespace's destination
+				// policy, every workspace is silently pinned to the old one, and the
+				// HCL does not mention it. So `Read` MUST NOT write the resolved
+				// value here; it appears in `resolved_destination_id` instead.
 				MarkdownDescription: "Names a namespace destination policy. Optional in v1; when supplied it must match " +
-					"the policy the service resolves, or the request is rejected.",
+					"the policy the service resolves, or the request is rejected. Optional **without** `Computed`, so " +
+					"deleting the line genuinely stops asserting a destination; the policy the service resolved appears in " +
+					"`resolved_destination_id`.",
 			},
 			"resolved_certificate_name": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The Key Vault object name the service actually uses.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
+			},
+			"resolved_destination_id": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "The namespace destination policy the service resolved this certificate's vault to " +
+					"(PROVISIONAL D-20). This is where the server's answer lives, so that `destination_id` can stay a pure " +
+					"statement of the caller's intent.\n\n" +
+					"`UseStateForUnknown` is justified by the destination being immutable in place (§6.2.1). WHOEVER SHIPS " +
+					"`destination_migration` MUST REMOVE IT, or a moved certificate keeps the old policy id in state.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 
 			// -------------------------------------------------------- key policy
@@ -474,6 +497,7 @@ type certificateResourceModel struct {
 	CertificateName         types.String `tfsdk:"certificate_name"`
 	DestinationID           types.String `tfsdk:"destination_id"`
 	ResolvedCertificateName types.String `tfsdk:"resolved_certificate_name"`
+	ResolvedDestinationID   types.String `tfsdk:"resolved_destination_id"`
 
 	Key types.Object `tfsdk:"key"`
 

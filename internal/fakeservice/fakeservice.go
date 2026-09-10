@@ -72,6 +72,11 @@ type Options struct {
 	DefaultACMEProfile       string
 	ValidationBindings       []contracts.ValidationBinding
 	Namespaces               []contracts.NamespaceDetail
+	// DestinationPolicies is the namespace destination grant table the fake
+	// resolves `destination_id` against. PROVISIONAL(D-20): the destination is
+	// SERVER-RESOLVED, so the id the fake stores is the policy's, never the
+	// caller's. Defaults to one grant for DefaultKeyVaultID. See normalise.go.
+	DestinationPolicies []DestinationPolicy
 	// PageSize bounds a list page, so the pagination path is exercised without
 	// seeding hundreds of registrations by hand.
 	PageSize int
@@ -226,6 +231,9 @@ func New(t *testing.T, opts ...func(*Options)) *Server {
 			{Name: "app_service", RequiresExportable: true, ExpectedPickup: ptr("48h")},
 			{Name: "keyvault_crypto_only", RequiresExportable: false},
 		}
+	}
+	if o.DestinationPolicies == nil {
+		o.DestinationPolicies = defaultDestinationPolicies()
 	}
 	if o.ValidationBindings == nil {
 		o.ValidationBindings = []contracts.ValidationBinding{

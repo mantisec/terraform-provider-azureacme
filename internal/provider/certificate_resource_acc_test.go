@@ -636,3 +636,314 @@ func checkNotAfterInTheFuture(resourceName string) resource.TestCheckFunc {
 		return nil
 	}
 }
+
+// ---------------------------------------------------------------------------
+// PROV-NORMALISED-ATTRIBUTE-DRIFT
+//
+// THE SINGLE MOST IMPORTANT PROPERTY OF THIS PROVIDER: apply, then the next plan
+// is EMPTY. A provider that cannot re-plan is unusable in a pipeline regardless
+// of what else works, and `terraform plan -detailed-exitcode` returning 2 — or,
+// worse, 1 — on an unchanged configuration breaks every gate built on it.
+//
+// THESE TESTS ONLY MEAN ANYTHING BECAUSE THE FAKE NORMALISES. Until
+// internal/fakeservice/normalise.go existed the fake ECHOED the request, so
+// round-trip stability was guaranteed by construction and eleven green
+// acceptance tests coexisted with a real `terraform plan` that aborted the whole
+// workspace with `destination_change_unsupported` (C2 Finding 2). If a future
+// change makes the fake echo `destination_id` or `verification` again, these
+// tests go on passing and protect nothing — so the fake's own suite asserts that
+// it normalises, and normalise.go says why.
+// ---------------------------------------------------------------------------
+
+// configVerification wraps a consumer_probe body in the `verification` attribute.
+func configVerification(body string) string {
+	return fmt.Sprintf(`
+  verification = {
+    consumer_probe = {
+%s
+    }
+  }`, body)
+}
+
+// TestAccCertificate_ApplyThenSecondPlanIsEmpty is the permanent guard.
+//
+// Every case applies a configuration against a service that NORMALISES the
+// request — server-resolving `destination_id` and materialising the whole
+// `verification` block — and then asserts that the plan is empty four ways:
+// immediately after the apply, after a refresh, as a standalone plan, and as a
+// standalone plan after an explicit refresh. A normalisation the provider fails
+// to absorb shows up in at least one of the four.
+//
+// BLOCKING TEST. Do not skip it, do not weaken it, and do not make the fake echo
+// to make it pass.
+func TestAccCertificate_ApplyThenSecondPlanIsEmpty(t *testing.T) {
+	cases := []struct {
+		name   string
+		extra  string
+		checks []resource.TestCheckFunc
+	}{
+		{
+			name:  "the six-concept minimum declares neither attribute",
+			extra: "",
+			checks: []resource.TestCheckFunc{
+				// THE DEFECT, ASSERTED AS FIXED. The service resolved a destination
+				// policy; `destination_id` is Optional WITHOUT Computed, so the
+				// resolved value must NOT be in it. Before the fix this value was
+				// "payments", and ModifyPlan's destination-change check then aborted
+				// the entire plan for every resource in the workspace.
+				resource.TestCheckNoResourceAttr("azureacme_certificate.api", "destination_id"),
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "resolved_destination_id",
+					fakeservice.DefaultDestinationPolicyID),
+				// And the materialised probe stays out of the configured attribute.
+				resource.TestCheckNoResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled"),
+			},
+		},
+		{
+			name:  "destination_id asserting the policy the service resolves",
+			extra: fmt.Sprintf("  destination_id = %q", fakeservice.DefaultDestinationPolicyID),
+			checks: []resource.TestCheckFunc{
+				// The caller's assertion is kept VERBATIM, not replaced by an
+				// identical server value, so the attribute still reads as what the
+				// user wrote.
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "destination_id",
+					fakeservice.DefaultDestinationPolicyID),
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "resolved_destination_id",
+					fakeservice.DefaultDestinationPolicyID),
+			},
+		},
+		{
+			name: "a fully configured consumer probe",
+			extra: configVerification(`      enabled         = true
+      expected_pickup = "8h"
+      endpoints       = [{ host = "api.example.com", port = 443, sni = "api.example.com" }]`),
+			checks: []resource.TestCheckFunc{
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled", "true"),
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.expected_pickup", "8h"),
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.endpoints.#", "1"),
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.endpoints.0.port", "443"),
+			},
+		},
+		{
+			name:  "a probe enabled with no endpoints block at all",
+			extra: configVerification(`      enabled = true`),
+			checks: []resource.TestCheckFunc{
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled", "true"),
+				// NULL is preserved as null. The service materialises `endpoints: []`,
+				// and writing an empty list where the configuration wrote nothing is
+				// the same permadiff in miniature.
+				resource.TestCheckNoResourceAttr("azureacme_certificate.api", "verification.consumer_probe.endpoints.#"),
+			},
+		},
+		{
+			name: "a probe with an explicitly empty endpoint list",
+			extra: configVerification(`      enabled   = true
+      endpoints = []`),
+			checks: []resource.TestCheckFunc{
+				// And an EMPTY list is preserved as an empty list. Collapsing the two
+				// in either direction is a diff on every plan.
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.endpoints.#", "0"),
+			},
+		},
+		{
+			name:  "a probe stated explicitly as disabled",
+			extra: configVerification(`      enabled = false`),
+			checks: []resource.TestCheckFunc{
+				resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled", "false"),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testAccPreCheck(t)
+			startFake(t)
+			cfg := configMinimal(tc.extra)
+
+			resource.Test(t, resource.TestCase{
+				ProtoV6ProviderFactories: protoV6Factories(),
+				Steps: []resource.TestStep{
+					{
+						Config: cfg,
+						ConfigPlanChecks: resource.ConfigPlanChecks{
+							// The plan Terraform would produce the moment the apply
+							// returns, and then the one it produces after reading the
+							// registration back from the service. The SECOND is the one
+							// that catches a normalisation mismatch, because the refresh
+							// is what pulls the normalised values into state.
+							PostApplyPreRefresh:  []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+							PostApplyPostRefresh: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+						},
+						Check: resource.ComposeAggregateTestCheckFunc(tc.checks...),
+					},
+					// A standalone plan. This is the step that would have FAILED before
+					// the fix, and not with a diff: with
+					// `Error: Changing the destination of an existing certificate
+					// registration is not supported`.
+					{Config: cfg, PlanOnly: true},
+					// An explicit refresh, then a plan, which is what a pipeline does.
+					{RefreshState: true, ExpectNonEmptyPlan: false},
+					{Config: cfg, PlanOnly: true},
+				},
+			})
+		})
+	}
+}
+
+// TestAccCertificate_ServerResolvedDestinationIDIsRevertible is the test that
+// JUSTIFIES THE SCHEMA CHOICE.
+//
+// `Optional + Computed` would also have silenced the plan error — and would have
+// made this test fail. Under O+C, deleting `destination_id` from the
+// configuration leaves the prior value in state, Terraform reports no change, and
+// the workspace is pinned to a destination policy its HCL does not mention. §5.3.1
+// names that exact failure: worst during a platform migration, when repointing a
+// namespace's destination policy makes every pinned registration wrong at once.
+//
+// So the provider stores the CONFIGURED value, and this proves the line can be
+// deleted.
+func TestAccCertificate_ServerResolvedDestinationIDIsRevertible(t *testing.T) {
+	testAccPreCheck(t)
+	startFake(t)
+
+	asserted := configMinimal(fmt.Sprintf("  destination_id = %q", fakeservice.DefaultDestinationPolicyID))
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6Factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: configMinimal(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("azureacme_certificate.api", "destination_id"),
+					resource.TestCheckResourceAttr("azureacme_certificate.api", "resolved_destination_id",
+						fakeservice.DefaultDestinationPolicyID),
+				),
+			},
+			{
+				// Adding the attribute to assert the policy already in effect must be
+				// an ordinary update, NOT a destination change. Before the fix this
+				// transition was itself a plan-aborting error, which is how C2's run
+				// found the second permadiff behind the first.
+				Config: asserted,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("azureacme_certificate.api", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.TestCheckResourceAttr("azureacme_certificate.api", "destination_id",
+					fakeservice.DefaultDestinationPolicyID),
+			},
+			{Config: asserted, PlanOnly: true},
+			{
+				// THE LINE IS DELETED. The plan must SHOW the removal and state must
+				// end up null. Under Optional+Computed the plan here would be empty
+				// and state would still say "payments".
+				Config: configMinimal(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("azureacme_certificate.api", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr("azureacme_certificate.api", "destination_id"),
+					// And the server's answer is still visible, in the attribute that
+					// is allowed to carry it.
+					resource.TestCheckResourceAttr("azureacme_certificate.api", "resolved_destination_id",
+						fakeservice.DefaultDestinationPolicyID),
+				),
+			},
+			{Config: configMinimal(""), PlanOnly: true},
+		},
+	})
+}
+
+// TestAccCertificate_VerificationBlockIsRevertible is the same argument for
+// `verification`, where the consequence of the O+C trap is worse than a confusing
+// diff: a consumer probe left running against endpoints the HCL no longer
+// mentions, producing `consumer_stale` alerts with no visible cause.
+//
+// It also pins the SERVER-SIDE half. The service applies defaults at create only
+// (G-8), so an update that merely OMITS `verification` inherits the stored probe
+// and the probe stays enabled for ever. The provider therefore always states
+// `enabled` on the wire, and the fake reproduces the inheritance so that this
+// test fails if the provider stops doing so.
+func TestAccCertificate_VerificationBlockIsRevertible(t *testing.T) {
+	testAccPreCheck(t)
+	srv := startFake(t)
+
+	probed := configMinimal(configVerification(`      enabled   = true
+      endpoints = [{ host = "api.example.com" }]`))
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6Factories(),
+		Steps: []resource.TestStep{
+			{
+				Config: configMinimal(""),
+				Check:  resource.TestCheckNoResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled"),
+			},
+			{
+				Config: probed,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled", "true"),
+					resource.TestCheckResourceAttr("azureacme_certificate.api", "verification.consumer_probe.endpoints.#", "1"),
+				),
+			},
+			{Config: probed, PlanOnly: true},
+			{
+				// THE BLOCK IS DELETED.
+				Config: configMinimal(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("azureacme_certificate.api", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.TestCheckNoResourceAttr("azureacme_certificate.api", "verification.consumer_probe.enabled"),
+			},
+			{Config: configMinimal(""), PlanOnly: true},
+		},
+	})
+
+	// THE PROPERTY THAT MATTERS, CHECKED ON THE SERVICE AND NOT ONLY IN STATE:
+	// the probe is actually OFF. State saying the block is gone while the service
+	// goes on probing would be the worst of the available outcomes.
+	reg := srv.Registration(accNamespace, accName)
+	if reg == nil {
+		t.Fatal("the registration is gone")
+	}
+	if reg.Spec.Verification == nil || reg.Spec.Verification.ConsumerProbe == nil {
+		t.Fatal("the service stored no verification block at all; the fake should always materialise one")
+	}
+	if enabled := reg.Spec.Verification.ConsumerProbe.Enabled; enabled == nil || *enabled {
+		t.Fatalf("deleting the `verification` block left the consumer probe ENABLED server-side (enabled=%v). "+
+			"The provider must STATE `enabled` on every write: the service applies defaults at create only, so an "+
+			"omitted field inherits the stored value and the probe never turns off.", enabled)
+	}
+}
+
+// TestAccCertificate_AssertingADifferentDestinationPolicyStillFailsThePlan keeps
+// the relaxation honest.
+//
+// Making the plan stable for `destination_id` meant narrowing §6.2.1: three of the
+// four transitions move nothing and must not abort the plan. The fourth still
+// must. Without this test the narrowing could quietly become "never check
+// `destination_id`", and a certificate could be pointed at a different destination
+// policy by a plan that looked like an ordinary in-place update.
+func TestAccCertificate_AssertingADifferentDestinationPolicyStillFailsThePlan(t *testing.T) {
+	testAccPreCheck(t)
+	startFake(t)
+
+	elsewhere := configMinimal(`  destination_id = "some-other-policy"`)
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6Factories(),
+		Steps: []resource.TestStep{
+			{Config: configMinimal("")},
+			{
+				Config:   elsewhere,
+				PlanOnly: true,
+				// And the instruction is one the reader can follow: the attribute was
+				// not set before, so "revert it to \"\"" would be no instruction at all.
+				ExpectError: regexp.MustCompile(`REMOVE .destination_id. from this resource`),
+			},
+		},
+	})
+}

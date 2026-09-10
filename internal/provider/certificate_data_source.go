@@ -317,8 +317,15 @@ func fillCertificateDataSource(ctx context.Context, reg *contracts.CertificateRe
 		m.IssuedDNSNames = issued
 		obj, d := types.ObjectValue(currentCertificateStringTypes(), map[string]attr.Value{
 			"version_secret_id": stringOrNull(cc.VersionSecretID), "version_certificate_id": stringOrNull(cc.VersionCertificateID),
-			"thumbprint_sha256": types.StringValue(cc.ThumbprintSHA256), "serial_number": stringOrNull(cc.SerialNumber),
-			"not_before": types.StringValue(cc.NotBefore), "not_after": types.StringValue(cc.NotAfter),
+			// The three fields the contract marks REQUIRED decode into non-pointer
+			// strings, so a field the service omitted arrives as "". Null, not "":
+			// handing a consumer an empty string it will interpolate into a
+			// comparison or a timestamp parse is worse than handing it nothing.
+			// The RESOURCE additionally diagnoses the absence by name
+			// (missingCertificateFieldDiagnostics); a data source read is not the
+			// place to fail an apply, so this one only declines to invent a value.
+			"thumbprint_sha256": requiredWireString(cc.ThumbprintSHA256), "serial_number": stringOrNull(cc.SerialNumber),
+			"not_before": requiredWireString(cc.NotBefore), "not_after": requiredWireString(cc.NotAfter),
 			"issued_at": stringOrNull(cc.IssuedAt), "published_at": stringOrNull(cc.PublishedAt),
 			"issuer": stringOrNull(cc.Issuer), "acme_profile": stringOrNull(cc.ACMEProfile),
 		})

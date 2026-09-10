@@ -326,3 +326,87 @@ func TestDeferredOperationCarriesAFarFutureEstimatedStart(t *testing.T) {
 		t.Fatalf("estimated_start is only %s away; the deferral horizon is DAYS", time.Until(start))
 	}
 }
+
+// TestTheFakeNormalisesRatherThanEchoing is the guard on the guard.
+//
+// Every plan-stability assertion in the provider's suite is worthless against a
+// fake that echoes the request: the round trip is then stable by construction.
+// That is not hypothetical — it is what happened. Eleven green acceptance tests
+// coexisted with a real `terraform plan` that aborted the entire workspace,
+// because `specReadFrom` copied `destination_id` and `verification` straight out
+// of the PUT body (C2 Finding 2).
+//
+// So this test asserts the fake does what the service does, for each field the
+// service is known to normalise. If someone "simplifies" normalise.go back into
+// an echo, this fails here rather than silently disarming the provider's suite.
+func TestTheFakeNormalisesRatherThanEchoing(t *testing.T) {
+	ctx := context.Background()
+	srv := fakeservice.New(t)
+	c := newClient(t, srv)
+
+	// A create that declares NEITHER normalised field — the six-concept minimum.
+	spec := contracts.CertificateSpecFields{
+		DNSNames: []string{"api.example.com"},
+		Destination: &contracts.DestinationFields{
+			KeyVaultID:      ptrTo(fakeservice.DefaultKeyVaultID),
+			CertificateName: ptrTo("payments-api"),
+			Type:            ptrTo("azure_key_vault"),
+		},
+	}
+	result, err := c.PutRegistration(ctx, "payments-prod", "payments-api", spec,
+		client.PutOptions{IfNoneMatchAny: true, IdempotencyKey: client.NewULID()})
+	if err != nil {
+		t.Fatalf("PutRegistration: %v", err)
+	}
+	reg := result.Registration
+	if reg == nil {
+		t.Fatal("the create returned no representation")
+	}
+
+	// 1. destination_id is SERVER-RESOLVED, not echoed. The caller sent none.
+	if reg.Spec.Destination == nil || reg.Spec.Destination.DestinationID == nil {
+		t.Fatal("the response carries no `destination_id`. PROVISIONAL(D-20) server-resolves the destination, so the " +
+			"response names a destination POLICY whether or not the caller did. A fake that leaves it absent cannot " +
+			"catch the normalisation mismatch that made `terraform plan` a hard error.")
+	}
+	if got := *reg.Spec.Destination.DestinationID; got != fakeservice.DefaultDestinationPolicyID {
+		t.Errorf("destination_id = %q, want the resolved policy %q", got, fakeservice.DefaultDestinationPolicyID)
+	}
+
+	// 2. verification is MATERIALISED, not echoed. The caller sent none.
+	if reg.Spec.Verification == nil || reg.Spec.Verification.ConsumerProbe == nil {
+		t.Fatal("the response carries no `verification`. The service's apply_defaults materialises the whole block " +
+			"for every registration, and that materialised block is the second permadiff of C2 Finding 2.")
+	}
+	if enabled := reg.Spec.Verification.ConsumerProbe.Enabled; enabled == nil || *enabled {
+		t.Errorf("verification.consumer_probe.enabled = %v, want an explicit false — §5.7's documented default", enabled)
+	}
+
+	// 3. AND IT INHERITS ON UPDATE (G-8). A field the caller omits takes the
+	//    stored value, not today's default. This is why the provider has to STATE
+	//    `enabled` on every write rather than omitting the block.
+	enabledSpec := spec
+	enabledSpec.Verification = &contracts.VerificationSpec{
+		ConsumerProbe: &contracts.ConsumerProbe{Enabled: ptrTo(true)},
+	}
+	revision := reg.Spec.Revision
+	if _, err := c.PutRegistration(ctx, "payments-prod", "payments-api", enabledSpec,
+		client.PutOptions{IfMatchRevision: &revision, IdempotencyKey: client.NewULID()}); err != nil {
+		t.Fatalf("enabling the probe: %v", err)
+	}
+	stored := srv.Registration("payments-prod", "payments-api")
+	revision = stored.Spec.Revision
+	omitted := spec // no verification key at all
+	if _, err := c.PutRegistration(ctx, "payments-prod", "payments-api", omitted,
+		client.PutOptions{IfMatchRevision: &revision, IdempotencyKey: client.NewULID()}); err != nil {
+		t.Fatalf("omitting verification: %v", err)
+	}
+	stored = srv.Registration("payments-prod", "payments-api")
+	if enabled := stored.Spec.Verification.ConsumerProbe.Enabled; enabled == nil || !*enabled {
+		t.Errorf("omitting `verification` on an update reset the probe to the default (enabled=%v). G-8 makes defaults "+
+			"apply AT CREATE ONLY, so the stored value must stand — and reproducing that here is what forces the "+
+			"provider to state `enabled` explicitly instead of relying on omission to turn a probe off.", enabled)
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }

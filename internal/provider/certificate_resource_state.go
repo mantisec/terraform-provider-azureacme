@@ -7,6 +7,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
@@ -95,6 +96,14 @@ func applyComputedFromResponse(
 	m.ResolvedCertificateName = stringOrNull(reg.Status.ResolvedCertificateName)
 	m.PublicationMode = stringOrNull(reg.Status.PublicationMode)
 
+	// PROVISIONAL(D-20): the server's resolved destination policy. It lives HERE,
+	// on a Computed attribute, and never in `destination_id` — see
+	// destinationIDFromResponse.
+	m.ResolvedDestinationID = types.StringNull()
+	if reg.Spec.Destination != nil {
+		m.ResolvedDestinationID = stringOrNull(reg.Spec.Destination.DestinationID)
+	}
+
 	m.LastSuccessfulRenewalAt = rfc3339.NewNull()
 	if reg.Status.Renewal != nil {
 		m.LastSuccessfulRenewalAt = rfc3339.NewValueFromPointer(reg.Status.Renewal.LastSuccessfulRenewalAt)
@@ -105,13 +114,31 @@ func applyComputedFromResponse(
 		m.CurrentCertificate = types.ObjectNull(currentCertificateAttrTypes())
 	} else {
 		cc := reg.Status.CurrentCertificate
+		// `thumbprint_sha256`, `not_before` and `not_after` are REQUIRED on
+		// `CurrentCertificate` in contracts/api/openapi.yaml, so the generated
+		// model decodes them into non-pointer strings and a field the service
+		// omitted — or sent as `null` — arrives here as "".
+		//
+		// Left alone, "" reaches rfc3339.ValidateAttribute as a KNOWN, INVALID
+		// timestamp, and the apply dies with `Invalid timestamp: ""` pointed at the
+		// resource block. That names no field, no service, and no next action; it
+		// reads as a provider bug; and because the value never lands in state it
+		// also provokes Terraform's own "the provider still indicated an unknown
+		// value … this is always a bug in the provider" on top. Two errors, one of
+		// them actively misleading, for a missing field in a response.
+		//
+		// So the absence is diagnosed HERE, by name, and the attribute is written
+		// null — which is a legal known value, so the misleading second error
+		// disappears and the user is left with exactly one actionable one.
+		missing := missingRequiredCertificateFields(cc)
+		diags.Append(missingCertificateFieldDiagnostics(reg, missing)...)
 		obj, d := types.ObjectValueFrom(ctx, currentCertificateAttrTypes(), currentCertificateModel{
 			VersionSecretID:      stringOrNull(cc.VersionSecretID),
 			VersionCertificateID: stringOrNull(cc.VersionCertificateID),
-			ThumbprintSHA256:     types.StringValue(cc.ThumbprintSHA256),
+			ThumbprintSHA256:     requiredWireString(cc.ThumbprintSHA256),
 			SerialNumber:         stringOrNull(cc.SerialNumber),
-			NotBefore:            rfc3339.NewValue(cc.NotBefore),
-			NotAfter:             rfc3339.NewValue(cc.NotAfter),
+			NotBefore:            requiredWireTimestamp(cc.NotBefore),
+			NotAfter:             requiredWireTimestamp(cc.NotAfter),
 			IssuedAt:             rfc3339.NewValueFromPointer(cc.IssuedAt),
 			PublishedAt:          rfc3339.NewValueFromPointer(cc.PublishedAt),
 			Issuer:               stringOrNull(cc.Issuer),
@@ -194,7 +221,6 @@ func applySpecFromResponse(
 
 	if reg.Spec.Destination != nil {
 		m.KeyVaultID = armid.NewValue(reg.Spec.Destination.KeyVaultID)
-		m.DestinationID = stringOrNull(reg.Spec.Destination.DestinationID)
 
 		// The defaulted-null rule. `certificate_name` is Optional WITHOUT
 		// Computed precisely so that removing it reverts to `name`; writing the
@@ -208,6 +234,26 @@ func applySpecFromResponse(
 		default:
 			m.CertificateName = types.StringValue(serverName)
 		}
+
+		// THE SAME RULE, FOR `destination_id`, AND FOR THE SAME REASON.
+		//
+		// PROVISIONAL(D-20) makes the destination SERVER-RESOLVED: the caller
+		// names a vault and the service answers with the destination POLICY it
+		// resolved, whether or not the caller supplied one. Writing that answer
+		// into `destination_id` — which is Optional WITHOUT Computed (§5.3.1) —
+		// puts a value in state that the configuration does not declare, and the
+		// very next `terraform plan` is not a diff but a HARD ERROR out of
+		// ModifyPlan's destination-change check, which aborts the WHOLE plan: one
+		// certificate makes the workspace unplannable for every resource in it and
+		// for every colleague.
+		//
+		// So state holds the CONFIGURED value and the two are compared
+		// semantically: when the caller asserted nothing, nothing is stored; when
+		// the caller asserted a policy and the server resolved the same one, the
+		// assertion is kept verbatim; and only a server answer that DISAGREES with
+		// the assertion is written back, because that is genuine drift and is the
+		// one case a user must see.
+		m.DestinationID = destinationIDFromResponse(reg.Spec.Destination.DestinationID, prior.DestinationID)
 	}
 
 	keyObj, d := types.ObjectValueFrom(ctx, keyAttrTypes(), keyModel{
@@ -262,12 +308,51 @@ func applySpecFromResponse(
 	return diags
 }
 
+// destinationIDFromResponse applies the defaulted-null rule of §7.2.4 to
+// `destination_id`.
+//
+// `server` is the policy id the service resolved (PROVISIONAL D-20); `prior` is
+// what the configuration asserted, carried in prior state. The configured value
+// wins unless the server's answer contradicts it.
+func destinationIDFromResponse(server *string, prior types.String) types.String {
+	if prior.IsNull() || prior.IsUnknown() {
+		// The caller asserted nothing. The server always has an answer, and
+		// storing it would make the attribute unrevertible and the next plan a
+		// hard error. The answer is in `resolved_destination_id`.
+		return types.StringNull()
+	}
+	if server == nil || *server == "" || *server == prior.ValueString() {
+		return prior
+	}
+	// The server resolved a DIFFERENT policy from the one the configuration
+	// asserts. That is real drift and the user has to see it, so the server's
+	// value goes into state and the next plan proposes putting it back.
+	return types.StringValue(*server)
+}
+
+// verificationObjectFrom maps the service's `spec.verification` onto the
+// `verification` attribute, PRESERVING THE CONFIGURED SHAPE whenever the two are
+// semantically equal.
+//
+// The service's `apply_defaults` MATERIALISES this block: a request with no
+// `verification` at all is stored as
+// `{consumer_probe: {enabled: false, expected_pickup: null, endpoints: []}}`.
+// `verification` is Optional WITHOUT Computed, so writing that materialised
+// object into state makes every workspace that omits the block propose removing
+// it — for ever. `Optional + Computed` is not the fix: a user who enabled a probe
+// and then deleted the block would keep a probe running against endpoints their
+// HCL no longer mentions, producing `consumer_stale` alerts with no visible cause
+// (§5.3.1).
+//
+// So the server's object is built and then compared semantically against prior
+// state. If they say the same thing, prior state is kept verbatim — which is what
+// makes deleting the block genuinely revert it.
 func verificationObjectFrom(ctx context.Context, spec *contracts.VerificationSpec, prior types.Object) (types.Object, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	if spec == nil || spec.ConsumerProbe == nil {
-		if prior.IsNull() {
-			return types.ObjectNull(verificationAttrTypes()), diags
-		}
+		// Nothing server-side. Null, not prior: an absent block and a default
+		// block are the same statement, and prior is either null already or was
+		// genuinely removed out of band.
 		return types.ObjectNull(verificationAttrTypes()), diags
 	}
 	probe := spec.ConsumerProbe
@@ -293,7 +378,127 @@ func verificationObjectFrom(ctx context.Context, spec *contracts.VerificationSpe
 
 	obj, d := types.ObjectValue(verificationAttrTypes(), map[string]attr.Value{"consumer_probe": probeObj})
 	diags.Append(d...)
+	if diags.HasError() {
+		return obj, diags
+	}
+	// THE SEMANTIC COMPARISON. Same meaning ⇒ keep what the configuration wrote.
+	if equal, d := verificationSemanticallyEqual(ctx, prior, obj); d.HasError() {
+		diags.Append(d...)
+	} else if equal {
+		return prior, diags
+	}
 	return obj, diags
+}
+
+// verificationSemanticallyEqual answers whether two `verification` objects say
+// the same thing, across the three normalisations the service applies:
+//
+//   - an ABSENT block and a default probe (`enabled = false`, no pickup, no
+//     endpoints) are the same statement;
+//   - a NULL `endpoints` list and an EMPTY one are the same statement;
+//   - a null `enabled` and `false` are the same statement.
+//
+// It is deliberately not `types.Object.Equal`: that is presence equality, and
+// presence is exactly what the service rewrites.
+func verificationSemanticallyEqual(ctx context.Context, a, b types.Object) (bool, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if a.IsUnknown() || b.IsUnknown() {
+		return false, diags
+	}
+	av, d := consumerProbeFacts(ctx, a)
+	diags.Append(d...)
+	bv, d := consumerProbeFacts(ctx, b)
+	diags.Append(d...)
+	if diags.HasError() {
+		return false, diags
+	}
+	return av.equal(bv), diags
+}
+
+// probeFacts is the MEANING of a `verification` block, with every
+// null-versus-empty-versus-absent distinction already collapsed.
+type probeFacts struct {
+	enabled        bool
+	expectedPickup string
+	endpoints      []probeEndpointFacts
+}
+
+type probeEndpointFacts struct {
+	host string
+	port int64
+	sni  string
+}
+
+func (a probeFacts) equal(b probeFacts) bool {
+	if a.enabled != b.enabled {
+		return false
+	}
+	if !a.enabled {
+		// A DISABLED PROBE DOES NOTHING, so its endpoints and pickup window are
+		// inert and two disabled probes are the same statement however they are
+		// spelled. This matters because neither `endpoints` nor `expected_pickup`
+		// can be CLEARED on the wire — both are `omitempty` in the generated model
+		// — so a probe that is turned off keeps whatever endpoints it last had.
+		// Comparing them would leave a permanent diff proposing a removal that no
+		// apply can perform, for values that have no effect.
+		//
+		// A probe being ENABLED out of band is still drift and is still reported:
+		// that is the first comparison above, and it is the one that matters.
+		return true
+	}
+	if a.expectedPickup != b.expectedPickup || len(a.endpoints) != len(b.endpoints) {
+		return false
+	}
+	for i := range a.endpoints {
+		// ORDER IS SIGNIFICANT: `endpoints` is a List, not a Set, because one
+		// certificate fronting several listeners has a meaningful order in the
+		// configuration and reordering it is a change the user wrote.
+		if a.endpoints[i] != b.endpoints[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func consumerProbeFacts(ctx context.Context, obj types.Object) (probeFacts, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	facts := probeFacts{}
+	if obj.IsNull() || obj.IsUnknown() {
+		return facts, diags
+	}
+	var vm verificationModel
+	diags.Append(obj.As(ctx, &vm, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() || vm.ConsumerProbe.IsNull() || vm.ConsumerProbe.IsUnknown() {
+		return facts, diags
+	}
+	var pm consumerProbeModel
+	diags.Append(vm.ConsumerProbe.As(ctx, &pm, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return facts, diags
+	}
+	facts.enabled = !pm.Enabled.IsNull() && !pm.Enabled.IsUnknown() && pm.Enabled.ValueBool()
+	if !pm.ExpectedPickup.IsNull() && !pm.ExpectedPickup.IsUnknown() {
+		facts.expectedPickup = pm.ExpectedPickup.ValueString()
+	}
+	if pm.Endpoints.IsNull() || pm.Endpoints.IsUnknown() {
+		return facts, diags
+	}
+	var eps []probeEndpointModel
+	diags.Append(pm.Endpoints.ElementsAs(ctx, &eps, false)...)
+	if diags.HasError() {
+		return facts, diags
+	}
+	for _, e := range eps {
+		ef := probeEndpointFacts{host: e.Host.ValueString(), port: 443}
+		if !e.Port.IsNull() && !e.Port.IsUnknown() {
+			ef.port = e.Port.ValueInt64()
+		}
+		if !e.SNI.IsNull() && !e.SNI.IsUnknown() {
+			ef.sni = e.SNI.ValueString()
+		}
+		facts.endpoints = append(facts.endpoints, ef)
+	}
+	return facts, diags
 }
 
 // buildSpecFromPlan projects the Terraform attributes onto the WIRE shape.
@@ -379,13 +584,30 @@ func buildSpecFromPlan(ctx context.Context, m certificateResourceModel) (contrac
 	if !m.CommonName.IsNull() && !m.CommonName.IsUnknown() {
 		spec.CommonName = strPtr(m.CommonName.ValueString())
 	}
+	// The wire ALWAYS carries an EFFECTIVE verification block, even when the
+	// configuration has none — the same rule as `certificate_name` above, for a
+	// sharper reason.
+	//
+	// The service applies defaults at CREATE ONLY (G-8): on an update a field the
+	// caller OMITTED inherits the value already stored. So a provider that simply
+	// leaves `verification` out when the user deletes the block does not turn the
+	// probe off — `enabled` comes back `true` from the previous spec, for ever,
+	// with nothing in the HCL to explain it. That is the §5.3.1 trap arriving
+	// through the server instead of through the schema, and omitting the block is
+	// what opens the door to it.
+	//
+	// `enabled` is therefore always stated. `expected_pickup` and `endpoints`
+	// cannot be: the generated wire model marks both `omitempty`, so this build
+	// has no way to say "the caller cleared them" — see the provider report's
+	// findings. Stating `enabled` is what makes the block revertible, because a
+	// disabled probe does nothing whatever its endpoints say.
+	probe := contracts.ConsumerProbe{Enabled: boolPtr(false)}
 	if !m.Verification.IsNull() && !m.Verification.IsUnknown() {
 		var vm verificationModel
 		diags.Append(m.Verification.As(ctx, &vm, basetypes.ObjectAsOptions{})...)
 		if !vm.ConsumerProbe.IsNull() && !vm.ConsumerProbe.IsUnknown() {
 			var pm consumerProbeModel
 			diags.Append(vm.ConsumerProbe.As(ctx, &pm, basetypes.ObjectAsOptions{})...)
-			probe := contracts.ConsumerProbe{}
 			if !pm.Enabled.IsNull() && !pm.Enabled.IsUnknown() {
 				probe.Enabled = boolPtr(pm.Enabled.ValueBool())
 			}
@@ -406,9 +628,9 @@ func buildSpecFromPlan(ctx context.Context, m certificateResourceModel) (contrac
 					probe.Endpoints = append(probe.Endpoints, pe)
 				}
 			}
-			spec.Verification = &contracts.VerificationSpec{ConsumerProbe: &probe}
 		}
 	}
+	spec.Verification = &contracts.VerificationSpec{ConsumerProbe: &probe}
 	return spec, diags
 }
 
@@ -489,3 +711,112 @@ func boolOrDefault(v *bool, fallback bool) types.Bool {
 func strPtr(s string) *string { return &s }
 func i64Ptr(v int64) *int64   { return &v }
 func boolPtr(v bool) *bool    { return &v }
+
+// -------------------------------------- the required current_certificate fields
+
+// requiredCurrentCertificateFields are the three fields
+// contracts/api/openapi.yaml marks REQUIRED on `CurrentCertificate`, in wire
+// spelling. They decode into non-pointer Go strings, so "required" buys no
+// decode-time check at all: an omitted or null field is indistinguishable from an
+// empty one and arrives as "".
+//
+// Keep this list in step with the contract. A field added to the contract's
+// `required` list and not added here produces the opaque failure this machinery
+// exists to prevent.
+var requiredCurrentCertificateFields = []string{"thumbprint_sha256", "not_before", "not_after"}
+
+// missingRequiredCertificateFields names the required fields the service did not
+// send, in contract order.
+func missingRequiredCertificateFields(cc *contracts.CurrentCertificate) []string {
+	if cc == nil {
+		return nil
+	}
+	present := map[string]string{
+		"thumbprint_sha256": cc.ThumbprintSHA256,
+		"not_before":        cc.NotBefore,
+		"not_after":         cc.NotAfter,
+	}
+	var missing []string
+	for _, field := range requiredCurrentCertificateFields {
+		if strings.TrimSpace(present[field]) == "" {
+			missing = append(missing, field)
+		}
+	}
+	return missing
+}
+
+// missingCertificateFieldDiagnostics turns a missing required field into an error
+// that NAMES THE FIELD, names the registration, says which side is at fault and
+// says what to do — one error per field, each against the Terraform attribute it
+// corresponds to, so the message lands on the right line.
+//
+// It is an ERROR and not a warning. The field is required by the wire contract,
+// the value is load-bearing (`not_before` is how a consumer knows whether the
+// certificate it was handed is yet valid), and the provider will not fabricate
+// one. Downgrading it would hide a service defect behind a green apply and put
+// incomplete state in front of every consumer reading these attributes.
+func missingCertificateFieldDiagnostics(reg *contracts.CertificateRegistration, missing []string) diag.Diagnostics {
+	var diags diag.Diagnostics
+	for _, field := range missing {
+		diags.AddAttributeError(
+			path.Root("current_certificate").AtName(field),
+			fmt.Sprintf("The service omitted the required field status.current_certificate.%s", field),
+			fmt.Sprintf(
+				"The certificate for %s/%s is published, but the service's representation of it carries no "+
+					"`status.current_certificate.%s`.\n\n"+
+					"That field is REQUIRED on `CurrentCertificate` in the API contract, so the provider decodes it as a "+
+					"plain string and an omitted or null value is indistinguishable from an empty one. The provider will "+
+					"not invent a value for it: %s\n\n"+
+					"This is a SERVICE defect, not a configuration mistake, and nothing in your configuration will fix "+
+					"it. The certificate itself is unaffected — it exists in the destination vault and the service will "+
+					"keep renewing it. `%s` is null in state and the rest of `current_certificate` is populated.\n\n"+
+					"Report it to your platform administrator, quoting registration %s and service instance %s. Once the "+
+					"service populates the field, the next `terraform apply` completes with no change to your "+
+					"configuration.\n\n"+
+					"If this apply was a CREATE, Terraform has marked the object tainted; `terraform untaint <address>` "+
+					"before re-applying, or the next plan proposes destroying a live certificate.",
+				reg.Namespace, reg.Name, field, consequenceOfMissing(field),
+				"current_certificate."+field, reg.RegistrationID, reg.ServiceInstanceID))
+	}
+	return diags
+}
+
+// consequenceOfMissing says why the field matters, so the report that reaches the
+// platform team carries the consequence and not just the field name.
+func consequenceOfMissing(field string) string {
+	switch field {
+	case "not_before":
+		return "a consumer cannot tell whether the certificate it has been handed is yet valid, and a fabricated " +
+			"timestamp would make an invalid certificate look in-date."
+	case "not_after":
+		return "every expiry alert and every renewal decision downstream of this state is computed from it."
+	case "thumbprint_sha256":
+		return "it is the only identity a consumer can compare against what a listener is actually serving, so " +
+			"without it no drift between the vault and the consumer is detectable."
+	default:
+		return "the contract marks it required."
+	}
+}
+
+// requiredWireTimestamp maps a required wire timestamp to a value, or to NULL
+// when the service sent nothing.
+//
+// Null rather than `rfc3339.NewValue("")`: "" is a KNOWN value that fails
+// rfc3339.ValidateAttribute, which aborts the state write, which in turn makes
+// Terraform report a second, misleading "unknown value after apply … always a bug
+// in the provider". The absence is already reported by name; state should carry
+// the legible form of "absent".
+func requiredWireTimestamp(raw string) rfc3339.String {
+	if strings.TrimSpace(raw) == "" {
+		return rfc3339.NewNull()
+	}
+	return rfc3339.NewValue(raw)
+}
+
+// requiredWireString is requiredWireTimestamp for a plain required string.
+func requiredWireString(raw string) types.String {
+	if strings.TrimSpace(raw) == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(raw)
+}
