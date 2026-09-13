@@ -4,7 +4,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+
+	"golang.org/x/net/idna"
 )
+
+// correctionsTargetUnicodeVersion is the IdnaMappingTable version uts46MappingCorrectionTable
+// repairs. Since x/net v0.55.0 the table is chosen by the COMPILING TOOLCHAIN, not by the x/net
+// pin: go1.27 and later build tables17.0.0.go, earlier toolchains tables15.0.0.go.
+const correctionsTargetUnicodeVersion = "15.0.0"
+
+// requireCorrectionsTargetUnicode stops a toolchain skew from masquerading as dead corrections.
+// Built with a newer toolchain than go.mod's `toolchain` line, every correction looks redundant,
+// and the mutation test below would advise deleting all of them — which would break every build
+// on the pinned toolchain, including the released binary's.
+func requireCorrectionsTargetUnicode(t *testing.T) {
+	t.Helper()
+	if idna.UnicodeVersion != correctionsTargetUnicodeVersion {
+		t.Fatalf("golang.org/x/net/idna is using Unicode %s, but the correction table targets %s. "+
+			"The table follows the compiling Go toolchain (go1.27+ selects 17.0.0). Run with the "+
+			"toolchain go.mod pins (e.g. GOTOOLCHAIN=go1.26.8 go test ./...). Do NOT delete "+
+			"corrections to make this pass: moving the toolchain to go1.27 is a deliberate "+
+			"migration of the correction table, its vector corpus and the IDNA sweep register.",
+			idna.UnicodeVersion, correctionsTargetUnicodeVersion)
+	}
+}
+
+func TestIDNATableIsTheUnicodeVersionTheCorrectionsTarget(t *testing.T) {
+	requireCorrectionsTargetUnicode(t)
+}
 
 // The correction table's own proof (SCAFFOLD-IDNA-DIFFERENTIAL-SWEEP).
 //
@@ -77,6 +104,7 @@ func corpusVectors(t *testing.T) []normVector {
 // case to fail. If none does, the entry is either unnecessary or unwitnessed, and both are worth
 // a red suite.
 func TestEveryCorrectionIsWitnessedByAVector(t *testing.T) {
+	requireCorrectionsTargetUnicode(t)
 	vectors := corpusVectors(t)
 
 	if wrong := corpusDisagreements(t, vectors); len(wrong) != 0 {

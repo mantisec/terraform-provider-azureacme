@@ -50,7 +50,14 @@ workspace read access to the platform's storage account keys and its full resour
 
 The full worked configuration is in
 [`examples/two-stage-bootstrap/`](https://github.com/mantisec/terraform-provider-azureacme/tree/main/examples/two-stage-bootstrap)
-in the provider repository. In outline:
+in the provider repository.
+
+> **The platform module is not yet published** on the Terraform Registry, so the
+> `mantisec/azureacme/azure` block below shows the shape of stage 1 rather than a configuration
+> you can initialise today. Deploy the service by whatever means you have, and publish the same
+> four-field connection profile from stage 1.
+
+In outline:
 
 ```terraform
 # ---------- stage 1: the platform team's workspace ----------

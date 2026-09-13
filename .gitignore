@@ -1,0 +1,4 @@
+# GoReleaser output. In the monorepo the root .gitignore covers this; in the published mirror
+# this directory IS the repository root and that file does not exist, so without this an
+# untracked dist/ marks every release binary as built from a modified tree (vcs.modified=true).
+/dist/

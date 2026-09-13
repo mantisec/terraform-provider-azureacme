@@ -94,6 +94,25 @@ jobs:
       # This step also preloads the gpg agent with the passphrase, which is why
       # `.goreleaser.yml`'s `signs.args` carry no passphrase of their own: a passphrase in
       # the signing arguments would be a passphrase in the command line.
+      # A missing passphrase does not fail the import below: the action imports the key and
+      # skips presetting the agent, and the failure surfaces later as an opaque `gpg --batch`
+      # signing error inside GoReleaser. Name the secrets here instead. Note the names:
+      # sibling provider repositories call the passphrase `PASSPHRASE`; this one does not.
+      - name: The signing secrets are present
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in GPG_PRIVATE_KEY GPG_PASSPHRASE; do
+            if [ -z "${!name}" ]; then
+              echo "${name} is not set in the provider-gpg-signing environment."
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
       - name: Import the signing key
         uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
         id: import_gpg
@@ -122,3 +141,7 @@ jobs:
           echo "uploaded to the Registry account that owns mantisec/azureacme. That upload"
           echo "is a one-off account action, not a step in this pipeline, and until it has"
           echo "happened every release here succeeds and no release is ever ingested."
+          echo
+          echo "For the FIRST release, the provider must also be published once: sign in to"
+          echo "registry.terraform.io as mantisec, Publish -> Provider, this repository. That"
+          echo "creates the webhook later releases rely on (runbook stage 0.5)."

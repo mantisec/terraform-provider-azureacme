@@ -13,8 +13,10 @@
 terraform {
   required_providers {
     azureacme = {
-      source  = "mantisec/azureacme"
-      version = "~> 1.0"
+      source = "mantisec/azureacme"
+      # Pre-1.0: `~> 0.1.0` takes 0.1.x patches only, because under 0.x a minor
+      # release may break. Move to `~> 1.0` once 1.0.0 is published.
+      version = "~> 0.1.0"
     }
     azurerm = {
       source  = "hashicorp/azurerm"

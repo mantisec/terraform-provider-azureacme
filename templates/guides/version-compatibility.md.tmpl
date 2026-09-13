@@ -83,6 +83,10 @@ terraform {
 `~> 1.0` accepts patches and minors within major 1 and refuses major 2 — which is exactly the
 boundary at which `apiMinorRequired` may move.
 
+> **Before 1.0.0 is published**, no release satisfies `~> 1.0`. Pin `version = "~> 0.1.0"`
+> instead: under 0.x a minor release may break, so accept 0.1.x patches only and move to
+> `~> 1.0` deliberately when 1.0.0 ships.
+
 ## The escape hatches, and why there are two of them
 
 ```terraform

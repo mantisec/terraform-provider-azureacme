@@ -1,6 +1,5 @@
 ---
 page_title: "azureacme Provider"
-subcategory: ""
 description: |-
   Manages durable certificate registrations through a Mantisec ACME certificate service. An azureacme_certificate is a standing instruction to keep a certificate valid, not one signed artefact.
 ---

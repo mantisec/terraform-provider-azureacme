@@ -34,6 +34,10 @@ variable "endpoint_hostname" {
   default     = "certs.platform.example.com"
 }
 
+# NOT YET PUBLISHED. The platform module is not on the Terraform Registry, so
+# this block does not initialise as written. It shows the SHAPE of stage 1: deploy
+# the service by whatever means you have, then publish the connection profile
+# below with the same four fields.
 module "acme_platform" {
   source  = "mantisec/azureacme/azure"
   version = "~> 1.0"
