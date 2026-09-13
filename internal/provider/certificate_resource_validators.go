@@ -184,22 +184,13 @@ func (certificateConfigValidator) ValidateResource(ctx context.Context, req reso
 	}
 
 	// --- deletion_policy = "delete" ------------------------------------------
-	if cfg.DeletionPolicy.ValueString() == "delete" &&
-		(cfg.AcknowledgeIrreversibleDelete.IsNull() || !cfg.AcknowledgeIrreversibleDelete.ValueBool()) {
-		// The purge-protection state of the destination vault is NOT knowable to
-		// this provider: it links no Azure control-plane SDK, and no service
-		// response carries the flag. The check therefore lands SERVER-SIDE as
-		// `400 acknowledgement_required`. This warning exists so the plan says so
-		// rather than letting the apply be the first mention of it.
-		resp.Diagnostics.AddAttributeWarning(path.Root("deletion_policy"),
-			"`deletion_policy = \"delete\"` may be irreversible for up to 90 days",
-			"If the destination vault has purge protection enabled, deleting the certificate soft-deletes it and the NAME "+
-				"cannot be reused until the retention period expires — 7 to 90 days, configurable only at vault creation.\n\n"+
-				"The service rejects this combination with `acknowledgement_required` unless "+
-				"`acknowledge_irreversible_delete = true`. Set it deliberately, or use `deletion_policy = \"retain\"`.\n\n"+
-				"For non-production destination vaults, create them with `soft_delete_retention_days = 7` and "+
-				"`purge_protection_enabled = false`, or a destroy/recreate loop in CI will wedge on the name.")
-	}
+	//
+	// NOT HERE. §5.4's purge-protection validator needs the destination policy,
+	// and `ValidateResourceConfig` runs BEFORE `ConfigureProvider` — the same
+	// reason `validateAgainstCapabilities` lives in `ModifyPlan`. It is
+	// `validatePurgeProtection` in certificate_resource_plan.go, where the
+	// namespace projection is reachable and the rule can be the ERROR §5.4 asks
+	// for instead of a warning that guesses.
 }
 
 // validateAgainstCapabilities is the half of §5.4 that needs the CACHED

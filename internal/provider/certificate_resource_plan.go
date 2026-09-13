@@ -38,6 +38,7 @@ func (r *certificateResource) ModifyPlan(ctx context.Context, req resource.Modif
 	// authorisation or policy mistake lands in the plan rather than after
 	// `terraform apply` has already changed other resources (F-066).
 	r.validateAgainstCapabilities(ctx, plan, &resp.Diagnostics)
+	r.validatePurgeProtection(ctx, plan, &resp.Diagnostics)
 
 	isCreate := req.State.Raw.IsNull()
 	if !isCreate {
@@ -59,7 +60,7 @@ func (r *certificateResource) ModifyPlan(ctx context.Context, req resource.Modif
 		replacing := len(resp.RequiresReplace) > 0 ||
 			!state.Namespace.Equal(plan.Namespace) || !state.Name.Equal(plan.Name)
 		if !replacing {
-			if diags := destinationChangeDiagnostics(state, plan, r.data.HasFeature("destination_migration")); len(diags) > 0 {
+			if diags := destinationChangeDiagnostics(state, plan, r.data.HasFeature(FeatureDestinationMigration)); len(diags) > 0 {
 				resp.Diagnostics.Append(diags...)
 				return
 			}
@@ -110,6 +111,153 @@ func (r *certificateResource) ModifyPlan(ctx context.Context, req resource.Modif
 	r.planVersionlessURIs(ctx, &plan, &resp.Diagnostics)
 
 	resp.Diagnostics.Append(resp.Plan.Set(ctx, &plan)...)
+}
+
+// validatePurgeProtection is §5.4's purge-protection validator: with
+// `deletion_policy = "delete"`, a purge-protected destination vault and no
+// acknowledgement, the plan is an ERROR.
+//
+// It could not be one until the service told the provider about the vault. The
+// provider links NO Azure control-plane SDK (§9.2) — deliberately, because that
+// would be a new dependency and a new permission on every consumer workspace —
+// so the flag has to arrive over the API, and it does:
+// `NamespaceDetail.permitted_destinations[].purge_protection_enabled`
+// (`API-PROVIDER-VISIBILITY-FIELDS`). Where it does not arrive — an older
+// service, a destination the projection does not name, a namespace read that
+// fails — the rule degrades to the WARNING it used to be everywhere, and the
+// hard rejection stays server-side as `400 acknowledgement_required`. Degrading
+// to silence instead would make an unreadable namespace look like a safe vault.
+//
+// This runs in ModifyPlan rather than in ConfigValidators for the same reason
+// validateAgainstCapabilities does: Terraform calls ValidateResourceConfig
+// BEFORE ConfigureProvider, so there is no client yet at ValidateConfig time.
+func (r *certificateResource) validatePurgeProtection(ctx context.Context, plan certificateResourceModel, diags *diag.Diagnostics) {
+	if plan.DeletionPolicy.ValueString() != "delete" {
+		return
+	}
+	if !plan.AcknowledgeIrreversibleDelete.IsNull() && !plan.AcknowledgeIrreversibleDelete.IsUnknown() &&
+		plan.AcknowledgeIrreversibleDelete.ValueBool() {
+		return
+	}
+
+	view := r.destinationPolicyView(ctx, plan)
+	if view != nil && view.PurgeProtectionEnabled != nil && !*view.PurgeProtectionEnabled {
+		// KNOWN ABSENT. Not a quieter warning — no warning at all. `delete`
+		// against a vault the platform team has declared purge-protection-free
+		// is reversible, the service will not ask for the acknowledgement, and a
+		// warning that fires on every plan for a correctly-configured
+		// non-production workspace is the kind of noise that teaches people to
+		// stop reading warnings.
+		return
+	}
+	if view != nil && view.PurgeProtectionEnabled != nil && *view.PurgeProtectionEnabled {
+		diags.AddAttributeError(path.Root("deletion_policy"),
+			"`deletion_policy = \"delete\"` needs `acknowledge_irreversible_delete = true` for this destination",
+			fmt.Sprintf("The destination policy for %s reports purge protection ENABLED%s.\n\n"+
+				"Destroying this resource therefore soft-deletes the Key Vault certificate and HOLDS ITS NAME for the "+
+				"retention period. The name cannot be reused, `az keyvault certificate purge` is refused while purge "+
+				"protection is on, and purge protection itself is configurable only at vault creation — so nothing you "+
+				"can do afterwards shortens the wait.\n\n"+
+				"Set `acknowledge_irreversible_delete = true` deliberately, or use `deletion_policy = \"retain\"`.\n\n"+
+				"This is a plan-time error rather than a warning because the service refuses the same combination with "+
+				"`400 acknowledgement_required`: without it the apply would fail after it had already begun changing "+
+				"other resources.",
+				destinationLabel(view, plan), retentionClause(view)))
+		return
+	}
+
+	// Purge protection is UNKNOWN here, not known-absent.
+	diags.AddAttributeWarning(path.Root("deletion_policy"),
+		"`deletion_policy = \"delete\"` may be irreversible for up to 90 days",
+		"If the destination vault has purge protection enabled, deleting the certificate soft-deletes it and the NAME "+
+			"cannot be reused until the retention period expires — 7 to 90 days, configurable only at vault creation.\n\n"+
+			"This service instance did not report the destination's purge-protection setting, so the provider cannot "+
+			"decide here. The service rejects the combination with `acknowledgement_required` unless "+
+			"`acknowledge_irreversible_delete = true`. Set it deliberately, or use `deletion_policy = \"retain\"`.\n\n"+
+			"For non-production destination vaults, create them with `soft_delete_retention_days = 7` and "+
+			"`purge_protection_enabled = false`, or a destroy/recreate loop in CI will wedge on the name.")
+}
+
+// destinationPolicyView finds the plan's destination in the namespace
+// projection, or nil.
+//
+// The match is by `destination_id` when the configuration names one, and by
+// vault resource id otherwise. AMBIGUITY IS NOT RESOLVED: two grants naming the
+// same vault answer nil rather than the first of them, because the two may
+// differ in exactly the field being read and picking one would make the
+// diagnostic depend on projection order.
+func (r *certificateResource) destinationPolicyView(ctx context.Context, plan certificateResourceModel) *contracts.DestinationPolicyView {
+	if r.data == nil || r.data.Client == nil {
+		return nil
+	}
+	if plan.Namespace.IsNull() || plan.Namespace.IsUnknown() || plan.Namespace.ValueString() == "" {
+		return nil
+	}
+	detail, err := r.data.Client.GetNamespace(ctx, plan.Namespace.ValueString())
+	if err != nil || detail == nil {
+		// A namespace the caller cannot read is not a reason to abort the plan:
+		// the read is an enrichment, and its failure is already reported by the
+		// data source and by Create.
+		return nil
+	}
+
+	wantID := ""
+	if !plan.DestinationID.IsNull() && !plan.DestinationID.IsUnknown() {
+		wantID = plan.DestinationID.ValueString()
+	}
+	wantVault := ""
+	if !plan.KeyVaultID.IsNull() && !plan.KeyVaultID.IsUnknown() {
+		// `armid.Canonical`, never a bare lower-case: ARM ids are
+		// case-insensitive in their TYPE segments and case-SENSITIVE in their
+		// resource names, and this file already has one comparison form. A
+		// second one here would answer "same vault?" differently from §6.2.1's
+		// destination-change check two functions up.
+		wantVault = armid.Canonical(plan.KeyVaultID.ValueString())
+	}
+	if wantID == "" && wantVault == "" {
+		return nil
+	}
+
+	var found *contracts.DestinationPolicyView
+	for i := range detail.PermittedDestinations {
+		candidate := &detail.PermittedDestinations[i]
+		matched := false
+		if wantID != "" {
+			matched = candidate.DestinationID == wantID
+		} else {
+			matched = wantVault != "" && armid.Canonical(candidate.KeyVaultID) == wantVault
+		}
+		if !matched {
+			continue
+		}
+		if found != nil {
+			return nil
+		}
+		found = candidate
+	}
+	return found
+}
+
+// destinationLabel names the destination the way the configuration does, so the
+// operator can find the attribute the diagnostic is about.
+func destinationLabel(view *contracts.DestinationPolicyView, plan certificateResourceModel) string {
+	if view.DestinationID != "" {
+		return "`" + view.DestinationID + "`"
+	}
+	if !plan.KeyVaultID.IsNull() && !plan.KeyVaultID.IsUnknown() {
+		return "`" + plan.KeyVaultID.ValueString() + "`"
+	}
+	return "this destination"
+}
+
+// retentionClause quotes the retention period when the policy records it. It is
+// NOT defaulted to 90: telling an operator with a 7-day vault that the name is
+// held for 90 days is a wrong number, and a wrong number is worse than none.
+func retentionClause(view *contracts.DestinationPolicyView) string {
+	if view.SoftDeleteRetentionDays == nil {
+		return ""
+	}
+	return fmt.Sprintf(", with a soft-delete retention of %d days", *view.SoftDeleteRetentionDays)
 }
 
 // planVersionlessURIs fills the two consumption URIs from values all known at
@@ -231,7 +379,21 @@ func destinationChangeDiagnostics(state, plan certificateResourceModel, migratio
 		"       pickup window (Application Gateway 4h; Front Door up to 72h).\n" +
 		"    4. Remove the old resource with a `removed` block; `deletion_policy = \"retain\"` leaves\n" +
 		"       the old certificate in place.\n\n" +
-		"  In v1 a certificate cannot move between vaults. (" + DiagDestinationChangeUnsupported + ")")
+		"  In v1 a certificate cannot move between vaults. (" + DiagDestinationChangeUnsupported + ")\n\n" +
+		// NAME THE FEATURE, NEVER A VERSION (F-065, release-engineering.md §9.3).
+		//
+		// This block is reached because the service at this endpoint does not
+		// advertise `" + FeatureDestinationMigration + "` in `/v1/capabilities.service.features` — NOT
+		// because its version is below some number the provider knows. Printing the
+		// feature name is what makes the message actionable: an operator can grep
+		// their own `/v1/capabilities` for it, and a platform team can enable it
+		// without a provider release. Printing a version instead would send them to
+		// upgrade a component that is not the constraint. The version-negotiation
+		// matrix asserts this string.
+		"  This service does not advertise the `" + FeatureDestinationMigration + "` feature. " +
+		"Feature availability is\n" +
+		"  read by NAME from `/v1/capabilities`, never inferred from the service version, so this is\n" +
+		"  a service-side capability and not a provider upgrade.")
 	diags.AddAttributeError(path.Root(first.attribute),
 		"Changing the destination of an existing certificate registration is not supported", b.String())
 	return diags

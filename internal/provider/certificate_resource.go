@@ -156,7 +156,7 @@ func (r *certificateResource) Create(ctx context.Context, req resource.CreateReq
 
 		// --- step 5: rate-limit deferral, FAIL FAST -------------------------
 		if result.Accepted.EstimatedStart != nil {
-			if stop, d := r.deferralFailsFast(*result.Accepted.EstimatedStart, deadline, createTimeout, ns); stop {
+			if stop, d := r.deferralFailsFast(*result.Accepted.EstimatedStart, result.Accepted.DeferralBudget, deadline, createTimeout, ns); stop {
 				resp.Diagnostics.Append(d)
 				return
 			}
@@ -296,7 +296,7 @@ func (r *certificateResource) putWithAccessDeniedRetry(
 // A bulk onboarding is deferred BY DESIGN and the deferral horizon is DAYS. No
 // timeouts.create accommodates that, and the alternative is ten resources each
 // sitting at "Still creating... [59m50s elapsed]" and then failing.
-func (r *certificateResource) deferralFailsFast(estimatedStart string, deadline time.Time, timeout time.Duration, ns string) (bool, diag.Diagnostic) {
+func (r *certificateResource) deferralFailsFast(estimatedStart string, budget *contracts.RateLimitBudget, deadline time.Time, timeout time.Duration, ns string) (bool, diag.Diagnostic) {
 	start, err := time.Parse(time.RFC3339, estimatedStart)
 	if err != nil {
 		return false, nil
@@ -308,12 +308,58 @@ func (r *certificateResource) deferralFailsFast(estimatedStart string, deadline 
 		"Issuance is queued behind a certificate authority rate limit ("+DiagCreateDeferredBeyondTimeout+")",
 		fmt.Sprintf(
 			"The service deferred this issuance until %s, which is beyond `timeouts.create` (%s).\n\n"+
+				"%s"+
 				"THE REGISTRATION HAS BEEN CREATED and will issue automatically when the budget resets. Nothing further "+
 				"is required, and re-running `terraform apply` will not make it happen sooner.\n\n"+
 				"To let this apply succeed now, set `wait_for = \"accepted\"` (see the note about "+
 				"`versionless_secret_id` being withheld until publication) and re-run, or re-run after the reset.\n\n"+
 				"Namespace: %s",
-			estimatedStart, timeout, ns))
+			estimatedStart, timeout, budgetLine(budget), ns))
+}
+
+// budgetLine renders `OperationAccepted.deferral_budget` (§7.1.6, requested by
+// `API-PROVIDER-VISIBILITY-FIELDS`).
+//
+// WHY THE NUMBERS AND NOT JUST THE DATE. "Queued behind a rate limit until
+// Monday" reads as a service fault, and the operator's next move is a support
+// ticket. "46 of 40 permitted in the last 7 days" reads as the bulk onboarding
+// it actually is, and the operator's next move is to stage the rollout. The
+// provider cannot compute either number — it holds no ledger — so the sentence
+// exists only because the service now sends them.
+//
+// An older service sends nothing here, and the paragraph is then omitted
+// entirely rather than printed with blanks: §2.1 requires a client to tolerate a
+// response that predates a field, and "used <nil> of <nil>" is not tolerating it.
+func budgetLine(budget *contracts.RateLimitBudget) string {
+	if budget == nil {
+		return ""
+	}
+	return fmt.Sprintf(
+		"Registered-domain budget: %d used of %d permitted per %s. The permitted figure is the "+
+			"EFFECTIVE limit the service applied, not the certificate authority's headline number: "+
+			"part of the budget is reserved for RENEWALS, so new issuance stops first and renewals "+
+			"of certificates already in service keep working.\n\n",
+		budget.Used, budget.Limit, humaniseWindow(budget.Window))
+}
+
+// humaniseWindow turns the wire's Go duration into the unit the certificate
+// authority publishes its limits in. `168h` is the truth and "7 days" is what
+// the reader is comparing against the CA's documentation; an unparseable or
+// non-whole-day window is printed verbatim rather than rounded, because a
+// rounded window makes the arithmetic in the sentence above wrong.
+func humaniseWindow(window string) string {
+	d, err := time.ParseDuration(window)
+	if err != nil || d <= 0 {
+		return window
+	}
+	if d%(24*time.Hour) == 0 {
+		days := int64(d / (24 * time.Hour))
+		if days == 1 {
+			return "1 day"
+		}
+		return fmt.Sprintf("%d days", days)
+	}
+	return window
 }
 
 func (r *certificateResource) addCreateError(ctx context.Context, diags *diag.Diagnostics, plan certificateResourceModel, err error) {
@@ -674,7 +720,7 @@ func (r *certificateResource) ImportState(ctx context.Context, req resource.Impo
 		if reg.Status.Ownership.OwnerDisplayName != nil {
 			display = " (" + *reg.Status.Ownership.OwnerDisplayName + ")"
 		}
-		resp.Diagnostics.AddError("This registration is owned by a different principal ("+DiagOwnershipTransferRequired+")",
+		resp.Diagnostics.AddError("This registration is owned by a different principal ("+DiagImportOwnershipTransferRequired+")",
 			fmt.Sprintf("`%s/%s` is owned by %s%s; this workspace authenticates as %s.\n\n"+
 				"Ownership transfer is never implicit. To take ownership, the current owner or a platform administrator "+
 				"must run:\n\n    POST /v1/namespaces/%s/certificates/%s/actions/claim\n        {\"acknowledge_transfer\": true}\n\n"+

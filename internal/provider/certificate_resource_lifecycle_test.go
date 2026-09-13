@@ -323,7 +323,7 @@ func TestImport_ForeignOwnerRequiresAClaim(t *testing.T) {
 	}
 	found := false
 	for _, d := range resp.Diagnostics.Errors() {
-		if strings.Contains(d.Summary(), DiagOwnershipTransferRequired) {
+		if strings.Contains(d.Summary(), DiagImportOwnershipTransferRequired) {
 			found = true
 			if !strings.Contains(d.Detail(), "actions/claim") {
 				t.Errorf("the message must name the claim endpoint; got:\n%s", d.Detail())
@@ -334,6 +334,6 @@ func TestImport_ForeignOwnerRequiresAClaim(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("expected %s; got %v", DiagOwnershipTransferRequired, resp.Diagnostics)
+		t.Fatalf("expected %s; got %v", DiagImportOwnershipTransferRequired, resp.Diagnostics)
 	}
 }

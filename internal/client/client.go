@@ -146,6 +146,12 @@ func New(cfg Config) (*Client, error) {
 // Endpoint returns the configured base URL, for diagnostics that must name it.
 func (c *Client) Endpoint() string { return c.baseURL.String() }
 
+// Audience returns the OPERATOR-CONFIGURED token audience this client requests
+// tokens for. It is fixed at construction and is never influenced by anything the
+// endpoint says: `/v1/capabilities` may report an audience and the provider may
+// warn that the two disagree, but the value here does not move (F-040, ADR 0019).
+func (c *Client) Audience() string { return c.cfg.Audience }
+
 // CredentialMethod names the credential method in use, for the 401 diagnostic.
 func (c *Client) CredentialMethod() string {
 	if c.cfg.Tokens == nil {

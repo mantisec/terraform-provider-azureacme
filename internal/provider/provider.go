@@ -112,11 +112,11 @@ func (p *azureACMEProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			},
 
 			"endpoint":                     schema.StringAttribute{Optional: true, MarkdownDescription: "Base URL of the service. Falls back to `MANTISEC_ACME_ENDPOINT`."},
-			"audience":                     schema.StringAttribute{Optional: true, MarkdownDescription: "Token audience. Operator-configured; MUST NOT be derived from an unauthenticated `/v1/capabilities` call."},
+			"audience":                     schema.StringAttribute{Optional: true, MarkdownDescription: "Token audience. **Required** — set it here, in `connection_profile`, or in `MANTISEC_ACME_AUDIENCE`. Operator-configured; MUST NOT be derived from an unauthenticated `/v1/capabilities` call. A reported mismatch is warned about, never acted on."},
 			"tenant_id":                    schema.StringAttribute{Optional: true, MarkdownDescription: "Entra tenant id. Falls back to `MANTISEC_ACME_TENANT_ID`, `ARM_TENANT_ID`, `AZURE_TENANT_ID`."},
 			"expected_service_instance_id": schema.StringAttribute{Optional: true, MarkdownDescription: "Checked once at Configure, before any resource is touched."},
 
-			"client_id":                   schema.StringAttribute{Optional: true, MarkdownDescription: "Entra client id of the calling identity."},
+			"client_id":                   schema.StringAttribute{Optional: true, MarkdownDescription: "Entra client id of the calling identity. **Mandatory on the managed-identity path**: with more than one user-assigned identity attached, an unqualified IMDS request can silently return the wrong identity's token. Falls back to `MANTISEC_ACME_CLIENT_ID`, `ARM_CLIENT_ID`, `AZURE_CLIENT_ID`."},
 			"use_oidc":                    schema.BoolAttribute{Optional: true, MarkdownDescription: "Authenticate with a federated OIDC token."},
 			"oidc_token":                  schema.StringAttribute{Optional: true, Sensitive: true, MarkdownDescription: "OIDC token. Prefer the environment variable."},
 			"oidc_token_file_path":        schema.StringAttribute{Optional: true, MarkdownDescription: "Path to a file containing the OIDC token."},
@@ -125,7 +125,7 @@ func (p *azureACMEProvider) Schema(_ context.Context, _ provider.SchemaRequest, 
 			"use_msi":                     schema.BoolAttribute{Optional: true, MarkdownDescription: "Authenticate with a managed identity."},
 			"client_certificate_path":     schema.StringAttribute{Optional: true, MarkdownDescription: "Path to a client certificate."},
 			"client_certificate_password": schema.StringAttribute{Optional: true, Sensitive: true, MarkdownDescription: "Password for the client certificate."},
-			"use_cli":                     schema.BoolAttribute{Optional: true, MarkdownDescription: "Fall back to the Azure CLI identity. Tried last. Defaults to `true`."},
+			"use_cli":                     schema.BoolAttribute{Optional: true, MarkdownDescription: "Gate on the last step of the ambient credential chain, the Azure CLI identity. Tried last, and only when no explicit method is configured. Defaults to `true`."},
 
 			"environment":         schema.StringAttribute{Optional: true, MarkdownDescription: "`public`, `usgovernment` or `china`. Drives the authority host and the Key Vault DNS suffix."},
 			"request_timeout":     schema.StringAttribute{Optional: true, MarkdownDescription: "Per-HTTP-request timeout, not per operation. Defaults to `60s`."},
@@ -162,7 +162,7 @@ func (p *azureACMEProvider) Configure(ctx context.Context, req provider.Configur
 
 	tokens := p.tokenSource
 	if tokens == nil {
-		tokens = buildTokenSource(resolved.CredentialMethod, resolved.Audience)
+		tokens = buildTokenSource(resolved.Credential)
 	}
 
 	terraformVersion := req.TerraformVersion
@@ -204,7 +204,7 @@ func (p *azureACMEProvider) Configure(ctx context.Context, req provider.Configur
 		return
 	}
 	data.Capabilities = caps
-	negotiateCapabilities(ctx, data, p.version, resolved.ExpectedServiceInstanceID, &resp.Diagnostics)
+	negotiateCapabilities(ctx, data, p.version, resolved, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}

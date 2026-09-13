@@ -5,6 +5,36 @@
 # the tag is a bare vX.Y.Z. Never tag the monorepo (§3.1).
 #
 # GPG key material comes from CI secrets and is never committed (§10.5).
+#
+# -----------------------------------------------------------------------------
+# REGISTRY SIGNING AND PACKAGING REQUIREMENTS, RE-VERIFIED 2026-09-13 against
+# developer.hashicorp.com/terraform/registry/providers/publishing and the current
+# hashicorp/terraform-provider-scaffolding-framework .goreleaser.yml.
+# release-engineering.md §4.4 carries a `[VERIFY]` note saying the requirements
+# have changed more than once and that a pre-2026 template must not be trusted.
+# This is that verification; the finding is recorded in
+# docs/agent-context/changelogs/2026-09-13-prov-docs-and-examples.md.
+#
+#   1. GPG key type: RSA or DSA. The registry API REJECTS the default ECC type,
+#      so `gpg --full-generate-key` with its default answers produces a key the
+#      registry will not accept. RSA 4096 is the recommended choice. The public
+#      key must be uploaded to the registry; signing is mandatory and Terraform
+#      CLI verifies the signature on download.  [UNCHANGED, re-confirmed]
+#   2. Release assets: the zip archives, `..._SHA256SUMS`, a BINARY (not ASCII
+#      armoured) `..._SHA256SUMS.sig`, and `..._manifest.json`.
+#   3. CHANGED, and the one thing this file was missing: the SHA256SUMS file must
+#      carry a checksum for the manifest as well as for each zip. That is
+#      `checksum.extra_files` below. `release.extra_files` alone only ATTACHES the
+#      manifest to the GitHub release; the registry additionally verifies it
+#      against SHA256SUMS, and an unlisted manifest fails ingestion after the tag
+#      is already public.
+#   4. Naming, all derived from `.ProjectName` — which in the mirror repository is
+#      `terraform-provider-azureacme`, the required `terraform-provider-{NAME}`
+#      pattern: binary `terraform-provider-{NAME}_v{VERSION}`, archive
+#      `terraform-provider-{NAME}_{VERSION}_{OS}_{ARCH}.zip`.
+#   5. Repository: public, lowercase, named `terraform-provider-{NAME}`, tagged
+#      with a semantic version prefixed `v`.
+# -----------------------------------------------------------------------------
 version: 2
 
 before:
@@ -33,9 +63,20 @@ archives:
     name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
 
 checksum:
+  # REQUIREMENT 3 ABOVE. The SHA256SUMS file must contain a checksum for the
+  # manifest as well as for every zip. Omitting this produces a release that
+  # looks complete — the manifest is attached, the signature verifies — and that
+  # the registry then refuses, after the tag is public and immutable.
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
   name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
   algorithm: sha256
 
+# The signature is over the checksums file only, and is DETACHED and BINARY:
+# no `--armor`, because the registry expects `..._SHA256SUMS.sig` to be a binary
+# signature. `--batch` is required in a non-interactive pipeline; GPG_FINGERPRINT
+# comes from the CI environment (§10.5) and the key it names must be RSA or DSA.
 signs:
   - artifacts: checksum
     args:
@@ -47,6 +88,9 @@ signs:
       - "--detach-sign"
       - "${artifact}"
 
+# Attaches the manifest to the GitHub release under the name the registry looks
+# for. This is a separate concern from the checksum entry above and both are
+# required: this one publishes the file, that one makes it verifiable.
 release:
   extra_files:
     - glob: 'terraform-registry-manifest.json'

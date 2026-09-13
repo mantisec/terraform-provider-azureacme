@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -65,6 +67,120 @@ func TestRedirectIsNotFollowed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "401") {
 		t.Errorf("the diagnostic must say the service should return 401 rather than redirect; got %q", err.Error())
+	}
+}
+
+// TestRedirectFromTheEndpointHostIsNeverFollowed_EveryStatus is the same rule
+// across the whole 3xx range, and it is the `307`/`302` assertion
+// AUTH-PROVIDER-CREDENTIAL-CHAIN requires.
+//
+// `302` is the Easy Auth default for an unauthenticated request. `307` is the
+// dangerous one: unlike `302` it preserves the METHOD AND THE BODY, so a followed
+// `307` on a PUT would replay the whole certificate registration — and the bearer
+// token — at whatever host the `Location` names. Go's http.Client follows both by
+// default, which is why `CheckRedirect` is set on every client this package
+// builds, including one a test supplies.
+//
+// The stub server counts hits and records any `Authorization` it sees, so the
+// test asserts the strong property (the token never left) rather than the weak
+// one (the call returned an error).
+func TestRedirectFromTheEndpointHostIsNeverFollowed_EveryStatus(t *testing.T) {
+	for _, status := range []int{
+		http.StatusMovedPermanently,  // 301
+		http.StatusFound,             // 302
+		http.StatusSeeOther,          // 303
+		http.StatusTemporaryRedirect, // 307
+		http.StatusPermanentRedirect, // 308
+	} {
+		for _, call := range []struct {
+			name string
+			req  Request
+		}{
+			{"GET", Request{Method: http.MethodGet, Path: "/capabilities"}},
+			{"PUT with a body", Request{
+				Method: http.MethodPut,
+				Path:   "/namespaces/payments-prod/certificates/api",
+				Body:   map[string]string{"namespace": "payments-prod"},
+			}},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", status, call.name), func(t *testing.T) {
+				var targetHits int
+				var authSeenAtTarget, bodySeenAtTarget string
+				target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					targetHits++
+					authSeenAtTarget = r.Header.Get("Authorization")
+					b, _ := io.ReadAll(r.Body)
+					bodySeenAtTarget = string(b)
+					w.Header().Set("Content-Type", "text/html")
+					_, _ = w.Write([]byte("<html>sign in</html>"))
+				}))
+				t.Cleanup(target.Close)
+
+				c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Location", target.URL+"/.auth/login/aad")
+					w.WriteHeader(status)
+				})
+
+				_, err := c.Do(context.Background(), call.req)
+				tErr, ok := AsTransportError(err)
+				if !ok {
+					t.Fatalf("a %d must be a transport error, got %T: %v", status, err, err)
+				}
+				if tErr.Reason != ReasonRedirect {
+					t.Fatalf("reason = %q, want %q", tErr.Reason, ReasonRedirect)
+				}
+				if tErr.Status != status {
+					t.Errorf("the error must carry the status it saw: got %d, want %d", tErr.Status, status)
+				}
+				if targetHits != 0 {
+					t.Fatalf("the redirect was followed %d time(s); CheckRedirect must return http.ErrUseLastResponse", targetHits)
+				}
+				if authSeenAtTarget != "" {
+					t.Fatalf("a bearer token reached the redirect target: %q", authSeenAtTarget)
+				}
+				if bodySeenAtTarget != "" {
+					t.Fatalf("a request body reached the redirect target: %q", bodySeenAtTarget)
+				}
+			})
+		}
+	}
+}
+
+// TestRedirectIsRefusedEvenOnACallerSuppliedHTTPClient. `Config.HTTPClient` is a
+// test seam; the redirect rule is not negotiable, so New() stamps CheckRedirect
+// onto whatever client it is handed. A test that could opt out would be testing
+// something the provider never does.
+func TestRedirectIsRefusedEvenOnACallerSuppliedHTTPClient(t *testing.T) {
+	var targetHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"service":{}}`))
+	}))
+	t.Cleanup(target.Close)
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/v1/capabilities")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(origin.Close)
+
+	// A client that WOULD follow redirects, handed in deliberately.
+	following := &http.Client{CheckRedirect: nil}
+	c, err := New(Config{
+		Endpoint:   origin.URL,
+		Audience:   "api://mantisec-acme",
+		Tokens:     StaticTokenSource{Value: "test-bearer-token"},
+		HTTPClient: following,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := c.Do(context.Background(), Request{Method: http.MethodGet, Path: "/capabilities"}); err == nil {
+		t.Fatal("a 307 must be an error even when the caller supplied a redirect-following http.Client")
+	}
+	if targetHits != 0 {
+		t.Fatalf("New() did not stamp CheckRedirect onto the supplied client; the target was hit %d time(s)", targetHits)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/mantisec/terraform-provider-azureacme/internal/contracts"
@@ -16,6 +15,15 @@ import (
 
 func key(namespace, name string) string { return namespace + "/" + name }
 
+// serve DISPATCHES ON THE CONTRACT, not on this file's reading of it.
+//
+// The route table it consults -- routes.gen.go -- is emitted from
+// contracts/api/openapi.yaml by contracts/tools/generate.py, so a path renamed
+// in the contract moves the fake with it and an operation withdrawn there stops
+// this file COMPILING. That is the whole reason the routing half of the fake is
+// generated: a fake hand-written from the specification prose and a client
+// hand-written from the same prose share one wrong assumption, agree with each
+// other, and prove nothing (terraform-provider-contract.md §11.1, §11.3).
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	s.mu.Lock()
@@ -40,39 +48,99 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Request-Id", id)
 	}
 
-	path := strings.TrimSuffix(r.URL.Path, "/")
-	if path == "/healthz" {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}, nil)
-		return
-	}
-	if !strings.HasPrefix(path, "/v1") {
+	route, params, ok := MatchRoute(r.Method, r.URL.Path)
+	if !ok {
+		// A documented address dialled with the wrong verb answers 405, not 404.
+		// The two are not interchangeable to a test author: 404 reads as "the
+		// contract has no such endpoint", which would send them to change the
+		// contract rather than the request.
+		if _, _, documented := RoutesForPath(r.URL.Path); documented {
+			s.problem(w, http.StatusMethodNotAllowed, contracts.CodeInvalidSpec)
+			return
+		}
 		s.problem(w, http.StatusNotFound, contracts.CodeRegistrationNotFound)
 		return
 	}
-	segs := strings.Split(strings.TrimPrefix(path, "/v1/"), "/")
 
-	switch {
-	case len(segs) == 1 && segs[0] == "capabilities" && r.Method == http.MethodGet:
-		s.handleCapabilities(w)
-	case len(segs) == 1 && segs[0] == "namespaces" && r.Method == http.MethodGet:
-		s.handleListNamespaces(w)
-	case len(segs) == 2 && segs[0] == "namespaces" && r.Method == http.MethodGet:
-		s.handleGetNamespace(w, segs[1])
-	case len(segs) == 1 && segs[0] == "validation-bindings" && r.Method == http.MethodGet:
-		s.handleListBindings(w)
-	case len(segs) == 2 && segs[0] == "validation-bindings" && r.Method == http.MethodGet:
-		s.handleGetBinding(w, segs[1])
-	case len(segs) == 3 && segs[0] == "namespaces" && segs[2] == "certificates" && r.Method == http.MethodGet:
-		s.handleListRegistrations(w, r, segs[1])
-	case len(segs) == 4 && segs[0] == "namespaces" && segs[2] == "certificates":
-		s.handleRegistration(w, r, segs[1], segs[3], body)
-	case len(segs) == 6 && segs[0] == "namespaces" && segs[2] == "certificates" && segs[4] == "actions":
-		s.handleAction(w, r, segs[1], segs[3], segs[5])
-	case len(segs) == 2 && segs[0] == "operations" && r.Method == http.MethodGet:
-		s.handleOperation(w, segs[1])
+	cw := s.conformant(w, route)
+	switch route.OperationID {
+	case OpGetHealth:
+		writeJSON(cw, http.StatusOK, map[string]string{"status": "ok"}, nil)
+	case OpGetCapabilities:
+		s.handleCapabilities(cw)
+	case OpListNamespaces:
+		s.handleListNamespaces(cw)
+	case OpGetNamespace:
+		s.handleGetNamespace(cw, params["namespace"])
+	case OpListValidationBindings:
+		s.handleListBindings(cw)
+	case OpGetValidationBinding:
+		s.handleGetBinding(cw, params["bindingId"])
+	case OpListCertificates:
+		s.handleListRegistrations(cw, r, params["namespace"])
+	case OpGetCertificate:
+		s.handleGetRegistration(cw, r, params["namespace"], params["name"])
+	case OpPutCertificate:
+		s.handlePutRegistration(cw, r, params["namespace"], params["name"], body, route)
+	case OpDeleteCertificate:
+		s.handleDeleteRegistration(cw, r, params["namespace"], params["name"])
+	case OpGetOperation:
+		s.handleOperation(cw, params["operationId"])
+	case OpForceRenewCertificate:
+		s.handleForceRenew(cw, params["namespace"], params["name"])
 	default:
-		s.problem(w, http.StatusNotFound, contracts.CodeRegistrationNotFound)
+		s.notImplemented(w, route)
 	}
+}
+
+// conformantWriter fails the test when the fake answers a matched operation with
+// a status the contract does not declare for it.
+//
+// A fake that invents a status is a fake that teaches the client to handle a
+// response the service will never send — the mirror image of the client and the
+// fake sharing one wrong assumption, and just as invisible. The declared set
+// comes from routes.gen.go, so it moves with the contract.
+//
+// Scripted responses are NOT checked: a rule installed with AddRule exists
+// precisely to produce what the contract does not describe — a 302 to a sign-in
+// page, an HTML 200 — and takeRule answers before dispatch ever reaches here.
+type conformantWriter struct {
+	http.ResponseWriter
+	fail    func(format string, args ...any)
+	route   Route
+	written bool
+}
+
+func (c *conformantWriter) WriteHeader(status int) {
+	if !c.written {
+		c.written = true
+		if !c.route.DeclaresStatus(status) {
+			c.fail("the fake answered %s %s (%s) with %d, which contracts/api/openapi.yaml "+
+				"does not declare for that operation. Declared: %v. Either the contract needs the "+
+				"status (change contracts/api/openapi.yaml and run `make contracts-generate`) or "+
+				"the fake is inventing a response the real service will never send.",
+				c.route.Method, c.route.Path, c.route.OperationID, status, c.route.Statuses)
+		}
+	}
+	c.ResponseWriter.WriteHeader(status)
+}
+
+func (s *Server) conformant(w http.ResponseWriter, route Route) http.ResponseWriter {
+	return &conformantWriter{ResponseWriter: w, fail: s.failf, route: route}
+}
+
+// notImplemented answers an operation the contract declares and the fake does not
+// model. It FAILS the test rather than returning a plausible-looking 404: a
+// silent 404 from an address the service does serve is how a test comes to prove
+// nothing at all.
+func (s *Server) notImplemented(w http.ResponseWriter, route Route) {
+	s.failf("the fake has no behaviour for %s %s (%s). It is a documented operation, so a "+
+		"canned 404 would be a lie. Add the handler to internal/fakeservice/, or script the "+
+		"response for this one test with AddRule.", route.Method, route.Path, route.OperationID)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_, _ = w.Write([]byte(`{"detail":"the fake service does not implement ` +
+		string(route.OperationID) + `"}` + "\n"))
 }
 
 func (s *Server) problem(w http.ResponseWriter, status int, code contracts.Code, opts ...ProblemOption) {
@@ -118,6 +186,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter) {
 			ConsumerProfiles:         o.ConsumerProfiles,
 			PublisherPrincipalID:     &o.PublisherPrincipalID,
 			PublisherClientID:        &o.PublisherClientID,
+			Audience:                 optionalString(o.ReportedAudience),
 			ACME: contracts.AcmeCapabilities{
 				DefaultProfile: o.DefaultACMEProfile, DirectoryURL: "https://localhost:14000/dir",
 				Environment: "staging", Profiles: profiles,
@@ -125,6 +194,16 @@ func (s *Server) handleCapabilities(w http.ResponseWriter) {
 		},
 	}
 	writeJSON(w, http.StatusOK, caps, nil)
+}
+
+// optionalString renders "" as an absent field rather than an empty one, so a
+// fake that was not told to report a value produces the same document a service
+// that does not report one produces.
+func optionalString(v string) *string {
+	if v == "" {
+		return nil
+	}
+	return &v
 }
 
 // ------------------------------------------------------------------ discovery
@@ -252,19 +331,6 @@ func (s *Server) handleListRegistrations(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, out, nil)
 }
 
-func (s *Server) handleRegistration(w http.ResponseWriter, r *http.Request, namespace, name string, body []byte) {
-	switch r.Method {
-	case http.MethodGet:
-		s.handleGetRegistration(w, r, namespace, name)
-	case http.MethodPut:
-		s.handlePutRegistration(w, r, namespace, name, body)
-	case http.MethodDelete:
-		s.handleDeleteRegistration(w, r, namespace, name)
-	default:
-		s.problem(w, http.StatusMethodNotAllowed, contracts.CodeInvalidSpec)
-	}
-}
-
 func (s *Server) handleGetRegistration(w http.ResponseWriter, _ *http.Request, namespace, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -282,7 +348,7 @@ func (s *Server) handleGetRegistration(w http.ResponseWriter, _ *http.Request, n
 	})
 }
 
-func (s *Server) handlePutRegistration(w http.ResponseWriter, r *http.Request, namespace, name string, body []byte) {
+func (s *Server) handlePutRegistration(w http.ResponseWriter, r *http.Request, namespace, name string, body []byte, route Route) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -291,7 +357,14 @@ func (s *Server) handlePutRegistration(w http.ResponseWriter, r *http.Request, n
 
 	// The rule that makes lost updates structurally impossible, and that fails
 	// the PROVIDER's own suite if it ever forgets a precondition (F-015).
-	if s.behaviour.requirePrecondition() && ifNoneMatch == "" && ifMatch == "" {
+	//
+	// WHICH OPERATIONS CARRY IT IS THE CONTRACT'S ANSWER, not this file's:
+	// route.RequiresPrecondition is generated from openapi.yaml and is true only
+	// where the document declares `428` AND accepts both conditional headers.
+	// DELETE takes an optional `If-Match` and declares no `428`, so it is not
+	// swept up by a rule that said "every mutation needs a precondition".
+	if route.RequiresPrecondition && s.behaviour.requirePrecondition() &&
+		ifNoneMatch == "" && ifMatch == "" {
 		RespondProblem(http.StatusPreconditionRequired, contracts.CodePreconditionRequired, s.opts.InstanceID)(w, nil)
 		return
 	}
@@ -402,6 +475,7 @@ func (s *Server) handlePutRegistration(w http.ResponseWriter, r *http.Request, n
 		}
 		formatted := primitives.FormatTimestamp(start)
 		accepted.EstimatedStart = &formatted
+		accepted.DeferralBudget = s.behaviour.DeferBudget
 	}
 	writeJSON(w, http.StatusAccepted, accepted, map[string]string{
 		"Operation-Location": "/v1/operations/" + op.op.ID,
@@ -484,6 +558,7 @@ func (s *Server) startOperationLocked(reg *Registration, opType contracts.Operat
 		formatted := primitives.FormatTimestamp(start)
 		op.op.EstimatedStart = &formatted
 		op.op.DeferralReason = ptr(string(contracts.CodeACMERateLimited))
+		op.op.DeferralBudget = s.behaviour.DeferBudget
 	}
 	s.operations[id] = op
 	reg.Status.Operation = &contracts.OperationSummary{

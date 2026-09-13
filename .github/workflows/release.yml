@@ -1,0 +1,124 @@
+# release — GoReleaser, in the MIRROR repository, on a bare tag.
+#
+# READ THIS FIRST: THIS FILE DOES NOT RUN IN THE MONOREPO. GitHub only reads
+# `.github/workflows/` at a repository ROOT, and in the monorepo this file sits three
+# levels down. It becomes live only after `provider-release.yml` subtree-pushes this
+# directory into `mantisec/terraform-provider-azureacme`, where this directory IS the root
+# and the tag is a bare `vX.Y.Z`.
+#
+# That is also why it is authored here rather than in the mirror. Mirrors are publication
+# targets, not development homes (release-engineering.md §4.1): the subtree push is
+# force-based, so a workflow committed only in the mirror is destroyed by the next release,
+# silently. Everything the mirror runs must arrive through the subtree.
+#
+# release-engineering.md §10.4 places this job precisely: the provider's release column is
+# "GoReleaser on a mirror bare tag (§4.4)". §4.4 is the asset contract — six binaries, a
+# `..._SHA256SUMS`, a detached binary `..._SHA256SUMS.sig`, and a
+# `terraform-registry-manifest.json` declaring protocol 6.0 — and it is `.goreleaser.yml`
+# beside this directory that states it, not this file. This file supplies three things
+# GoReleaser cannot supply itself: the Go toolchain, the GPG key, and the release identity.
+#
+# NOT COVERED BY `.github/scripts/check_workflow_hygiene.py`, which scans the monorepo's
+# own `.github/workflows/` and the provider's — see that script's `WORKFLOW_ROOTS`. The
+# rules it can assert about this file (SHA-pinned actions, read-only default permissions,
+# a declared concurrency group) are asserted; the ones about §10.2 path filters and the
+# six-prefix naming are not, because they are properties of the monorepo's workflow set and
+# this file is not part of it.
+name: release
+
+on:
+  push:
+    tags:
+      # BARE, and only in the mirror. The monorepo rejects this shape outright
+      # (`ci-tag-guard.yml`, release-engineering.md §3.1).
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  # NOT cancel-in-progress. A cancelled GoReleaser run can leave a partially-uploaded
+  # GitHub Release — assets present, checksums or signature missing — against a tag that is
+  # already public and that the Registry may already be trying to ingest.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  goreleaser:
+    name: Build, sign and publish the release
+    runs-on: ubuntu-latest
+    # release-engineering.md §10.5: "GPG signing material in a GitHub environment with
+    # required reviewers, used only by the provider release job." This is that job, and
+    # this environment exists in the MIRROR repository.
+    environment: provider-gpg-signing
+    permissions:
+      # Justification: GoReleaser creates the GitHub Release and uploads the archives, the
+      # checksums, the signature and the manifest to it. That is a write to this
+      # repository's contents and there is no narrower permission for it. Nothing else in
+      # this workflow writes anything.
+      contents: write
+    steps:
+      # A subtree push puts this file wherever it is told to. If that is ever the wrong
+      # repository, the release must fail here rather than publish a provider under an
+      # address consumers cannot install from — the provider address is a one-way door
+      # (release-engineering.md §2, D-37, F-115).
+      - name: This is the provider mirror
+        env:
+          EXPECTED: mantisec/terraform-provider-azureacme
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REPOSITORY}" != "${EXPECTED}" ]; then
+            echo "REFUSED: this workflow is running in ${GITHUB_REPOSITORY}, not ${EXPECTED}."
+            echo "release-engineering.md §4.4: the mirror must be public and named"
+            echo "terraform-provider-azureacme, because the Terraform Registry derives the"
+            echo "provider's type from the repository name."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # GoReleaser reads the tag and the history to determine the version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The key must be RSA or DSA: the Registry API rejects the default ECC type, so a key
+      # made by accepting `gpg --full-generate-key`'s defaults is one the Registry will not
+      # take. Re-verified 2026-09-13 against
+      # developer.hashicorp.com/terraform/registry/providers/publishing.
+      #
+      # This step also preloads the gpg agent with the passphrase, which is why
+      # `.goreleaser.yml`'s `signs.args` carry no passphrase of their own: a passphrase in
+      # the signing arguments would be a passphrase in the command line.
+      - name: Import the signing key
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
+        id: import_gpg
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          # Consumed by `.goreleaser.yml`'s `signs.args`. The fingerprint is not a secret —
+          # the public key is published to the Registry — but it must name the key that was
+          # just imported, not a key the runner happened to have.
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: What happens next
+        run: |
+          echo "The GitHub Release now carries the archives, ..._SHA256SUMS, a detached"
+          echo "binary ..._SHA256SUMS.sig and ..._manifest.json."
+          echo
+          echo "The Registry ingests it only if the public half of the signing key is"
+          echo "uploaded to the Registry account that owns mantisec/azureacme. That upload"
+          echo "is a one-off account action, not a step in this pipeline, and until it has"
+          echo "happened every release here succeeds and no release is ever ingested."

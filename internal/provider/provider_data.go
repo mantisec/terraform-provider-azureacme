@@ -55,6 +55,16 @@ func (d *providerData) CallerPrincipalID() string {
 	return d.Capabilities.Caller.PrincipalID
 }
 
+// FeatureDestinationMigration is the one `/v1/capabilities.service.features` name
+// this provider gates on today.
+//
+// It is a constant rather than a literal because it appears in TWO places that
+// must never disagree: the `HasFeature` lookup, and the plan-time diagnostic that
+// tells the operator which feature was absent. A diagnostic naming a feature the
+// lookup does not ask for sends a platform team to enable the wrong thing
+// (release-engineering.md §9.3, F-065).
+const FeatureDestinationMigration = "destination_migration"
+
 // HasFeature is NAME-based feature gating. Never version arithmetic: a client
 // wanting `destination_migration` checks for the string, not for
 // `api_version >= 1.6`.

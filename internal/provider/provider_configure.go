@@ -14,8 +14,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-
-	"github.com/mantisec/terraform-provider-azureacme/internal/client"
 )
 
 // The three embedded version constants of §3.2.
@@ -36,13 +34,16 @@ type resolvedConfig struct {
 	Endpoint                  string
 	Audience                  string
 	TenantID                  string
+	ClientID                  string
 	ExpectedServiceInstanceID string
 	Environment               string
 	RequestTimeout            time.Duration
 	MaxRetries                int
 	SkipVersionCheck          bool
 	SkipInstanceCheck         bool
-	CredentialMethod          string
+	// Credential is the §2.4 rules 1-3 outcome. Zero-valued when resolution
+	// failed, in which case `diags` carries the reason.
+	Credential credentialSelection
 }
 
 // envChain returns the first non-empty value from HCL then each environment
@@ -129,22 +130,23 @@ func resolveConfig(ctx context.Context, cfg Model, diags *diag.Diagnostics) reso
 	}
 
 	if out.Endpoint == "" {
-		out.Endpoint = envChain(cfg.Endpoint, "MANTISEC_ACME_ENDPOINT")
+		out.Endpoint = envChain(cfg.Endpoint, chainEndpoint.names...)
 	}
 	if out.Audience == "" {
 		// NEVER derived from an unauthenticated /v1/capabilities call (F-040): a
 		// rogue endpoint could otherwise name an audience for which the CI
 		// identity already holds a token, turning the provider into a confused
 		// deputy.
-		out.Audience = envChain(cfg.Audience, "MANTISEC_ACME_AUDIENCE")
+		out.Audience = envChain(cfg.Audience, chainAudience.names...)
 	}
 	if out.TenantID == "" {
-		out.TenantID = envChain(cfg.TenantID, "MANTISEC_ACME_TENANT_ID", "ARM_TENANT_ID", "AZURE_TENANT_ID")
+		out.TenantID = envChain(cfg.TenantID, chainTenantID.names...)
 	}
+	out.ClientID = envChain(cfg.ClientID, chainClientID.names...)
 	if out.ExpectedServiceInstanceID == "" {
-		out.ExpectedServiceInstanceID = envChain(cfg.ExpectedServiceInstanceID, "MANTISEC_ACME_SERVICE_INSTANCE_ID")
+		out.ExpectedServiceInstanceID = envChain(cfg.ExpectedServiceInstanceID, chainServiceInstanceID.names...)
 	}
-	if env := envChain(cfg.Environment, "MANTISEC_ACME_ENVIRONMENT", "ARM_ENVIRONMENT", "AZURE_ENVIRONMENT"); env != "" {
+	if env := envChain(cfg.Environment, chainEnvironment.names...); env != "" {
 		out.Environment = env
 	}
 	if raw := envChain(cfg.RequestTimeout, "MANTISEC_ACME_REQUEST_TIMEOUT"); raw != "" {
@@ -167,7 +169,26 @@ func resolveConfig(ctx context.Context, cfg Model, diags *diag.Diagnostics) reso
 				"The endpoint is the base URL of a certificate service deployed by a SEPARATE Terraform configuration. "+
 				"This provider never manages that deployment.")
 	}
-	out.CredentialMethod = resolveCredentialMethod(ctx, cfg, diags)
+	// `audience` is OPERATOR-CONFIGURED AND REQUIRED (ADR 0019,
+	// identity-and-trust-boundaries.md §9.3). It is deliberately never derived
+	// from `/v1/capabilities`: that call is answered before the caller has proved
+	// anything, so a rogue, misconfigured or DNS-hijacked endpoint naming
+	// Microsoft Graph or ARM would harvest a token carrying the caller's full
+	// permissions (F-040). An absent audience therefore fails here rather than
+	// being discovered from the endpoint it is supposed to constrain.
+	if out.Audience == "" {
+		diags.AddAttributeError(path.Root("audience"), "The token audience is not configured",
+			"Set `audience` (or `connection_profile.audience`), or the `MANTISEC_ACME_AUDIENCE` environment "+
+				"variable. The provider requests a token for `{audience}/.default`.\n\n"+
+				"The audience is NOT discovered from the service. `/v1/capabilities` may report the audience it "+
+				"expects and this provider warns when the two disagree, but it never adopts the reported value: an "+
+				"endpoint that could name its own audience could name Microsoft Graph or ARM instead and collect a "+
+				"token carrying every permission the caller holds.")
+	}
+	if diags.HasError() {
+		return out
+	}
+	out.Credential = resolveCredentialSelection(ctx, cfg, out, diags)
 	return out
 }
 
@@ -190,126 +211,56 @@ func addUnknownEndpointDiagnostic(diags *diag.Diagnostics, attribute string) {
 			"platform module and the certificates are in one configuration, which is exactly what a small team will try.")
 }
 
-// resolveCredentialMethod implements §2.4 rules 1 and 2: MORE THAN ONE explicit
-// method is an ERROR; exactly one is used alone.
-//
-// NEVER DefaultAzureCredential. It falls through silently to a developer
-// identity, which in CI means a job that should have failed authenticates as
-// whoever last ran `az login` on a self-hosted runner. The failure mode is a
-// WRONG-IDENTITY SUCCESS, not an error.
-func resolveCredentialMethod(_ context.Context, cfg Model, diags *diag.Diagnostics) string {
-	type method struct {
-		name string
-		set  bool
-	}
-	useOIDC, oidcSet := envChainBool(cfg.UseOIDC, "MANTISEC_ACME_USE_OIDC", "ARM_USE_OIDC")
-	useMSI, msiSet := envChainBool(cfg.UseMSI, "MANTISEC_ACME_USE_MSI", "ARM_USE_MSI")
-	certPath := envChain(cfg.ClientCertificatePath, "MANTISEC_ACME_CLIENT_CERTIFICATE_PATH", "ARM_CLIENT_CERTIFICATE_PATH")
-
-	explicit := []method{
-		{"use_oidc", oidcSet && useOIDC},
-		{"use_msi", msiSet && useMSI},
-		{"client_certificate_path", certPath != ""},
-	}
-	var chosen []string
-	for _, m := range explicit {
-		if m.set {
-			chosen = append(chosen, m.name)
-		}
-	}
-	if len(chosen) > 1 {
-		diags.AddError("More than one credential method is configured: "+strings.Join(quoteEach(chosen), ", "),
-			"Determinism beats convenience. Configure exactly one explicit credential method, or leave them all unset "+
-				"and let the ordered ambient chain apply.\n\n"+
-				"`DefaultAzureCredential` is deliberately NOT used anywhere in this provider: it falls through silently to "+
-				"a developer identity, so a CI job that should have failed authenticates as whoever last ran `az login` on "+
-				"the runner. That failure mode is a wrong-identity SUCCESS, not an error.")
-		return ""
-	}
-	if len(chosen) == 1 {
-		return chosen[0]
-	}
-
-	// The ordered ambient chain, each step gated on its OWN environment
-	// precondition.
-	switch {
-	case os.Getenv("AZURE_FEDERATED_TOKEN_FILE") != "" && os.Getenv("AZURE_CLIENT_ID") != "":
-		return "workload_identity"
-	case os.Getenv("IDENTITY_ENDPOINT") != "" || os.Getenv("MSI_ENDPOINT") != "":
-		return "managed_identity"
-	default:
-		return "azure_cli"
-	}
-}
-
-// buildTokenSource turns the resolved method into a TokenSource.
-//
-// SCOPE NOTE. Entra token ACQUISITION is owned by AUTH-PROVIDER-CREDENTIAL-CHAIN
-// and needs `azidentity`, which this build does not link. What lives here is the
-// SELECTION logic of §2.4 (rules 1-3), which is what the provider contract owns,
-// plus two sources that need no SDK:
-//
-//   - MANTISEC_ACME_TOKEN: a pre-acquired bearer token. This is how CI and the
-//     acceptance suite authenticate against a fake or a proxied service.
-//   - the OIDC token file, when `use_oidc` names one.
-//
-// Any other method returns a source that fails with a diagnostic naming the
-// missing piece, rather than silently sending no Authorization header to a
-// production endpoint.
-func buildTokenSource(method, audience string) client.TokenSource {
-	if raw := os.Getenv("MANTISEC_ACME_TOKEN"); raw != "" {
-		return client.StaticTokenSource{Value: raw, MethodName: "static_token_from_environment"}
-	}
-	return &deferredTokenSource{method: method, audience: audience}
-}
-
-type deferredTokenSource struct {
-	method   string
-	audience string
-}
-
-func (d *deferredTokenSource) Method() string { return d.method }
-
-func (d *deferredTokenSource) Token(context.Context) (string, error) {
-	if file := os.Getenv("AZURE_FEDERATED_TOKEN_FILE"); d.method == "workload_identity" && file != "" {
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return "", fmt.Errorf("reading the federated token file %q: %w", file, err)
-		}
-		return strings.TrimSpace(string(b)), nil
-	}
-	return "", fmt.Errorf(
-		"this provider build cannot acquire an Entra token with the %q method: the credential chain "+
-			"(AUTH-PROVIDER-CREDENTIAL-CHAIN) is not linked into this build. "+
-			"Supply a pre-acquired bearer token for audience %q in MANTISEC_ACME_TOKEN, or use a build that links it",
-		d.method, d.audience)
-}
-
 // negotiateCapabilities implements §3.2.
-func negotiateCapabilities(ctx context.Context, data *providerData, providerVersion string, expectedInstanceID string, diags *diag.Diagnostics) {
+func negotiateCapabilities(ctx context.Context, data *providerData, providerVersion string, resolved resolvedConfig, diags *diag.Diagnostics) {
 	caps := data.Capabilities
 	if caps == nil {
 		return
 	}
 	service := caps.Service
+	expectedInstanceID := resolved.ExpectedServiceInstanceID
+
+	// THE CONFUSED-DEPUTY GUARD, REPORTING HALF (F-040, ADR 0019).
+	//
+	// `/v1/capabilities` MAY report the audience the service expects. The provider
+	// compares it with the operator-configured one and WARNS on a mismatch — and
+	// that is the entire extent of it. It never adopts the reported value, because
+	// the call that carries it is answered before the caller has proved anything:
+	// a rogue, misconfigured or DNS-hijacked endpoint that could name its own
+	// audience could name Microsoft Graph or ARM instead and be handed a token
+	// carrying every permission the caller holds. A warning tells an operator they
+	// have a real misconfiguration; acting on it would BE the misconfiguration.
+	if service.Audience != nil && *service.Audience != "" && *service.Audience != resolved.Audience {
+		diags.AddWarning("The service reports a different token audience ("+DiagAudienceMismatchReported+")",
+			fmt.Sprintf("Configured `audience`: %q.\nThe service at %s reports it expects %q.\n\n"+
+				"The provider is CONTINUING WITH THE CONFIGURED AUDIENCE. It never adopts an audience reported by an "+
+				"endpoint: `/v1/capabilities` is answered before the caller has proved anything, so an endpoint able "+
+				"to name its own audience could name Microsoft Graph or ARM instead and collect a token carrying "+
+				"every permission you hold.\n\n"+
+				"If the request is rejected with `token_audience_mismatch`, the reported value is probably the "+
+				"correct one — change `audience` deliberately, after checking that `endpoint` names the service you "+
+				"meant.",
+				resolved.Audience, data.Client.Endpoint(), *service.Audience))
+	}
 
 	if !data.SkipVersionCheck {
-		major, minor, ok := parseAPIVersion(service.APIVersion)
-		switch {
-		case !ok:
+		major, _, _ := parseAPIVersion(service.APIVersion)
+		switch classifyAPIVersion(apiMajor, apiMinorRequired, service.APIVersion) {
+		case apiVersionUnreadable:
 			diags.AddWarning("The service reported an unreadable API version",
 				fmt.Sprintf("`api_version` was %q; expected `major.minor`. Proceeding without the version assertions.", service.APIVersion))
-		case major != apiMajor:
+		case apiVersionMajorMismatch:
 			diags.AddError("The service speaks a different API major version",
 				fmt.Sprintf("This provider speaks API major %d; the service at %s reports %s.\n\n"+
 					"A major version is the compatibility boundary. Upgrade or downgrade the provider to a release that "+
 					"speaks API %d.x.", apiMajor, data.Client.Endpoint(), service.APIVersion, major))
 			return
-		case minor < apiMinorRequired:
+		case apiVersionMinorBelowRequired:
 			diags.AddError("The service is older than this provider requires",
 				fmt.Sprintf("This provider requires API %d.%d or later; the service reports %s.\n\n"+
 					"Ask your platform administrator to upgrade the service.", apiMajor, apiMinorRequired, service.APIVersion))
 			return
+		case apiVersionAcceptable:
 		}
 
 		// FEATURE GATING IS BY NAME, never by version arithmetic, so a HIGHER
@@ -360,6 +311,57 @@ func negotiateCapabilities(ctx context.Context, data *providerData, providerVers
 		"instance_id": service.InstanceID, "instance_name": service.InstanceName,
 		"api_version": service.APIVersion, "features": service.Features,
 	})
+}
+
+// apiVersionVerdict is the declared outcome of ONE (provider, service) API
+// version pairing — the rule table of release-engineering.md §9.3.
+//
+// It is a named type rather than a bare bool pair so the version-negotiation
+// matrix (version_matrix_test.go, CI-VERSION-MATRIX-SECRET-SURFACE) can enumerate
+// every outcome the provider is capable of reaching and fail when a pairing
+// reaches one nobody declared. A silent fourth outcome is exactly the compatibility
+// bug the matrix exists to catch.
+type apiVersionVerdict int
+
+const (
+	// apiVersionUnreadable is a version string that is not `major.minor`. It is a
+	// WARNING, not an error: a service that cannot spell its version is a service
+	// bug, and refusing to plan over it would make a provider release the only
+	// escape from someone else's typo.
+	apiVersionUnreadable apiVersionVerdict = iota
+	// apiVersionMajorMismatch is fatal in BOTH directions. The major version is
+	// the compatibility boundary, so a service one major ahead is as unusable as
+	// one major behind.
+	apiVersionMajorMismatch
+	// apiVersionMinorBelowRequired is fatal: the provider needs a feature set the
+	// service predates.
+	apiVersionMinorBelowRequired
+	// apiVersionAcceptable covers the equal minor AND every HIGHER one. A higher
+	// minor proceeds — feature gating is by NAME, never by version arithmetic
+	// (F-065), so a newer service simply works and its unknown fields, features,
+	// enum values and error codes are ignored.
+	apiVersionAcceptable
+)
+
+// classifyAPIVersion is the version half of §3.2, separated from the diagnostics
+// so the rule table can be asserted for a provider requirement OTHER than the one
+// this build ships. `apiMinorRequired` is 0 today, which makes
+// `apiVersionMinorBelowRequired` unreachable through the fake service harness —
+// every minor below the required one is also a different major. Keeping the rule
+// exercised through this function is what stops it rotting until the day the
+// constant rises.
+func classifyAPIVersion(providerMajor, providerMinorRequired int, serviceAPIVersion string) apiVersionVerdict {
+	major, minor, ok := parseAPIVersion(serviceAPIVersion)
+	switch {
+	case !ok:
+		return apiVersionUnreadable
+	case major != providerMajor:
+		return apiVersionMajorMismatch
+	case minor < providerMinorRequired:
+		return apiVersionMinorBelowRequired
+	default:
+		return apiVersionAcceptable
+	}
 }
 
 func parseAPIVersion(v string) (major, minor int, ok bool) {

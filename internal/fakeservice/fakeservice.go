@@ -16,6 +16,17 @@
 // renamed in the contract breaks compilation here rather than surfacing as a
 // mysterious decode failure in production.
 //
+// WHAT IS GENERATED, AND WHY ONLY THAT. routes.gen.go — the operation ids, the
+// paths a client dials, the statuses each operation declares, and which
+// operations reject a request carrying no precondition header — is emitted from
+// contracts/api/openapi.yaml by contracts/tools/generate.py and drift-checked by
+// contracts/tools/check_drift.py. Everything in this file and in state.go is
+// written by hand, because the contract does not describe a state machine or a
+// scenario knob. The split is the whole point: a fake hand-written from the same
+// specification prose as the client agrees with the client and with nothing
+// else, so the two share one wrong assumption and the tests prove nothing.
+// Never hand-edit routes.gen.go; change the contract and regenerate.
+//
 // HOW TO USE IT FROM ANOTHER PACKAGE:
 //
 //	srv := fakeservice.New(t)                 // t.Cleanup closes it
@@ -68,10 +79,17 @@ type Options struct {
 	ConsumerProfiles         []contracts.ConsumerProfile
 	PublisherPrincipalID     string
 	PublisherClientID        string
-	ACMEProfiles             []string
-	DefaultACMEProfile       string
-	ValidationBindings       []contracts.ValidationBinding
-	Namespaces               []contracts.NamespaceDetail
+	// ReportedAudience is the `service.audience` field of /v1/capabilities.
+	//
+	// Empty means the field is absent, which is the default because a service is
+	// not obliged to report it. Set it to something OTHER than the provider's
+	// configured audience to drive the confused-deputy guard: the provider must
+	// WARN and keep using the audience its operator configured (F-040, ADR 0019).
+	ReportedAudience   string
+	ACMEProfiles       []string
+	DefaultACMEProfile string
+	ValidationBindings []contracts.ValidationBinding
+	Namespaces         []contracts.NamespaceDetail
 	// DestinationPolicies is the namespace destination grant table the fake
 	// resolves `destination_id` against. PROVISIONAL(D-20): the destination is
 	// SERVER-RESOLVED, so the id the fake stores is the policy's, never the
@@ -106,6 +124,11 @@ type Behaviour struct {
 	// DeferOperation reports state "deferred" with EstimatedStart.
 	DeferOperation      bool
 	DeferEstimatedStart time.Time
+	// DeferBudget is the registered-domain budget the deferral is queued behind,
+	// carried on the 202 AND on the operation record. Nil models a service that
+	// predates the field, which is the case §2.1 makes the client tolerate: the
+	// fail-fast diagnostic must still fire, just without the numbers.
+	DeferBudget *contracts.RateLimitBudget
 	// OperationFails makes the operation terminate in `failed` with this code.
 	OperationFails    bool
 	OperationFailCode contracts.Code
@@ -144,6 +167,11 @@ type Server struct {
 	rules         []*Rule
 	requests      []RecordedRequest
 	seq           int
+	// fail is how the fake reports a CONTRACT violation of its own: an
+	// undeclared status, or a documented operation it does not model. It is
+	// t.Errorf in every real use. It is a field only so the guards can be seen
+	// going red — a guard nobody has watched fail is not a guard.
+	fail func(format string, args ...any)
 }
 
 // RecordedRequest is one observed request, for the "asserted by counting
@@ -248,6 +276,7 @@ func New(t *testing.T, opts ...func(*Options)) *Server {
 		opts:          o,
 		registrations: map[string]*Registration{},
 		operations:    map[string]*operationState{},
+		fail:          t.Errorf,
 	}
 	s.http = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.http.Close)
@@ -307,6 +336,24 @@ func (s *Server) ResetRequests() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests = nil
+}
+
+// failf reports a violation through the installed reporter. The read is locked
+// because the server answers on its own goroutines.
+func (s *Server) failf(format string, args ...any) {
+	s.mu.Lock()
+	report := s.fail
+	s.mu.Unlock()
+	report(format, args...)
+}
+
+// setFail replaces the reporter. Test-only, and only from inside this package:
+// it exists so the contract guards can be exercised without failing the test
+// that is exercising them.
+func (s *Server) setFail(report func(format string, args ...any)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fail = report
 }
 
 func ptr[T any](v T) *T { return &v }

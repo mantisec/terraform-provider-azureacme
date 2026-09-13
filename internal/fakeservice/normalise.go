@@ -47,10 +47,18 @@ import (
 )
 
 // DestinationPolicy is one namespace destination grant: the policy id the
-// service resolves to, and the vault it grants.
+// service resolves to, the vault it grants, and the vault's soft-delete
+// posture as the destination policy records it.
 type DestinationPolicy struct {
 	ID         string
 	KeyVaultID string
+	// PurgeProtectionEnabled and SoftDeleteRetentionDays are POINTERS because
+	// `nil` is a distinct answer on the wire: it means the policy does not
+	// record the posture, and the provider must then warn rather than raise
+	// §5.4's error. A bool would collapse "unknown" into "false", which is the
+	// one mistake the field exists to prevent.
+	PurgeProtectionEnabled  *bool
+	SoftDeleteRetentionDays *int64
 }
 
 // DefaultDestinationPolicyID is the policy id the fake resolves
@@ -95,7 +103,12 @@ func (s *Server) permittedDestinationsLocked() []contracts.DestinationPolicyView
 	policies := s.destinationPoliciesLocked()
 	out := make([]contracts.DestinationPolicyView, 0, len(policies))
 	for _, p := range policies {
-		out = append(out, contracts.DestinationPolicyView{DestinationID: p.ID, KeyVaultID: p.KeyVaultID})
+		out = append(out, contracts.DestinationPolicyView{
+			DestinationID:           p.ID,
+			KeyVaultID:              p.KeyVaultID,
+			PurgeProtectionEnabled:  p.PurgeProtectionEnabled,
+			SoftDeleteRetentionDays: p.SoftDeleteRetentionDays,
+		})
 	}
 	return out
 }

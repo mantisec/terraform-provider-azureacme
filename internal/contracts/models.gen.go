@@ -9,6 +9,11 @@ import "encoding/json"
 
 // Health
 type Health struct {
+	// `degraded` in every mode in which issuance is disabled fleet-wide — reconciliation-only
+	// after an epoch mismatch, `flags.readOnly`, an account-level issuance pause, the per-CA
+	// circuit breaker (INV-9, `catalogue-and-concurrency.md` §11.3). The mode's NAME is
+	// deliberately not here: one bit is what A-3's availability probe needs, and a name would be
+	// an unauthenticated disclosure of the instance's internal state.
 	Status string `json:"status"`
 	// Extra preserves fields this build does not know about, so a newer
 	// writer's field survives an older reader's round trip.
@@ -109,10 +114,17 @@ type Capabilities struct {
 
 // ServiceCapabilities
 type ServiceCapabilities struct {
-	ACME                 AcmeCapabilities           `json:"acme"`
-	APIVersion           string                     `json:"api_version"`
-	APIVersionsSupported []string                   `json:"api_versions_supported"`
-	Build                map[string]json.RawMessage `json:"build,omitempty"`
+	ACME                 AcmeCapabilities `json:"acme"`
+	APIVersion           string           `json:"api_version"`
+	APIVersionsSupported []string         `json:"api_versions_supported"`
+	// The token audience this deployment expects, reported FOR DIAGNOSTICS ONLY. A client MUST NOT
+	// derive its audience from this field: `/v1/capabilities` is reachable before the caller has
+	// proved anything, so a rogue, misconfigured or DNS-hijacked endpoint that named Microsoft
+	// Graph or ARM here would harvest a token carrying the caller's full permissions (F-015, ADR
+	// 0019). The audience is operator-configured on the client; this value exists so a mismatch
+	// can be WARNED about, never acted on.
+	Audience *string                    `json:"audience,omitempty"`
+	Build    map[string]json.RawMessage `json:"build,omitempty"`
 	// Reported but NOT part of the client's compatibility check — the client never reads the
 	// catalogue. A service build MUST refuse to start if the catalogue schema version is higher
 	// than it supports.
@@ -289,6 +301,18 @@ type DestinationPolicyView struct {
 	// capability probe returns `404` ("the grant works, the name is free"), and the probe CONFIRMS
 	// the redirect rather than detecting it.
 	KeyVaultID string `json:"key_vault_id"`
+	// The destination vault's purge-protection setting, as the DESTINATION POLICY records it.
+	// RESPONSE-ONLY, and read from the policy document rather than from Azure: the provider links
+	// no Azure control-plane SDK (provider contract §9.2), so without this field a
+	// `deletion_policy = "delete"` against a purge-protected vault can only be a plan-time WARNING
+	// with the hard rejection landing server-side as `400 acknowledgement_required` — after apply
+	// has begun. `null` means the policy does not record it, which is NOT "false": an unknown
+	// posture must not be reported as a safe one.
+	PurgeProtectionEnabled *bool `json:"purge_protection_enabled,omitempty"`
+	// How long a soft-deleted certificate holds its NAME, 7 to 90 days. Configurable only at vault
+	// creation, which is why the diagnostic quotes it rather than telling the operator to change
+	// it. `null` means the policy does not record it.
+	SoftDeleteRetentionDays *int64 `json:"soft_delete_retention_days,omitempty"`
 	// Extra preserves fields this build does not know about, so a newer
 	// writer's field survives an older reader's round trip.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -596,9 +620,20 @@ type ProbeEndpoint struct {
 
 // RegistrationStatus -- SERVICE-WRITTEN, CLIENT-READ. No client request can set any part of it.
 type RegistrationStatus struct {
-	Audit      *Audit                `json:"audit,omitempty"`
-	Conditions []Condition           `json:"conditions,omitempty"`
-	Consumers  []ConsumerObservation `json:"consumers,omitempty"`
+	Audit *Audit `json:"audit,omitempty"`
+	// What every renewal re-authorises against. It is a NAMESPACE and never a principal: anchoring
+	// renewal on the creating or last-modifying identity makes a routine offboarding a silent
+	// certificate expiry 45 days later, and makes a compromised-then-remediated pipeline's
+	// registrations renew for ever.
+	AuthorizationAnchor *AuthorizationAnchor `json:"authorization_anchor,omitempty"`
+	// What policy authorised this registration, last time authorisation was evaluated. `null` only
+	// on a record written before the field existed. It is SERVICE-WRITTEN and lives here rather
+	// than under `spec` because no client may set it; the `Authorized` condition carries the same
+	// revision, and this field carries the instant as well so "authorised, but against a snapshot
+	// from six months ago" is answerable.
+	AuthorizedUnder *AuthorizedUnder      `json:"authorized_under,omitempty"`
+	Conditions      []Condition           `json:"conditions,omitempty"`
+	Consumers       []ConsumerObservation `json:"consumers,omitempty"`
 	// `null` while the first issuance is in flight. An update publishes the new version, verifies
 	// it, and only then flips this field: the working certificate is never removed before its
 	// replacement is verified (guarantee G-7).
@@ -618,11 +653,36 @@ type RegistrationStatus struct {
 	Phase               string               `json:"phase"`
 	PreviousCertificate *PreviousCertificate `json:"previous_certificate,omitempty"`
 	// One service-owned knob, exposed read-only. `merge` in v1.
-	PublicationMode           *string        `json:"publication_mode,omitempty"`
+	PublicationMode *string `json:"publication_mode,omitempty"`
+	// How many Key Vault versions this registration has published. MONOTONIC, because Key Vault
+	// cannot delete a version: the count only ever rises, and it is what makes the 500-version
+	// backup cap visible before it is reached. Advanced only by a publication whose post-merge
+	// read-back and current-version assertion both held, so a verification bug cannot burn the
+	// object's backup budget while the count still reads healthy. It is also the publication-rate
+	// guard's input.
+	PublishedVersionCount     *int64         `json:"published_version_count,omitempty"`
 	Renewal                   *RenewalStatus `json:"renewal,omitempty"`
 	ResolvedACMEProfile       *string        `json:"resolved_acme_profile,omitempty"`
 	ResolvedCertificateName   *string        `json:"resolved_certificate_name,omitempty"`
 	ResolvedValidationBinding *string        `json:"resolved_validation_binding,omitempty"`
+	// Extra preserves fields this build does not know about, so a newer
+	// writer's field survives an older reader's round trip.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// AuthorizedUnder -- The answer to "what policy authorised this certificate?", which is
+// unanswerable without it.
+type AuthorizedUnder struct {
+	EvaluatedAt    string `json:"evaluated_at"`
+	PolicyRevision int64  `json:"policy_revision"`
+	// Extra preserves fields this build does not know about, so a newer
+	// writer's field survives an older reader's round trip.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// AuthorizationAnchor -- The renewal anchor, and the only one.
+type AuthorizationAnchor struct {
+	Namespace string `json:"namespace"`
 	// Extra preserves fields this build does not know about, so a newer
 	// writer's field survives an older reader's round trip.
 	Extra map[string]json.RawMessage `json:"-"`
@@ -772,11 +832,35 @@ type RegistrationSummary struct {
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
+// RateLimitBudget -- The budget a deferral is queued behind. RESPONSE-ONLY and additive under
+// §2.1. It is always the REGISTERED-DOMAIN counter — the one whose horizon is DAYS — never an
+// aggregate over every counter the admission gate consulted, because the client renders these
+// numbers to a human who is about to decide whether to wait.
+type RateLimitBudget struct {
+	// The EFFECTIVE limit the gate compared `used` against — not the certificate authority's
+	// headline figure. The gate reserves a fraction of the budget for renewals, so new issuance
+	// stops below the published number; a diagnostic quoting the published number instead would
+	// send the operator to argue with the CA about a limit the CA did not apply.
+	Limit int64 `json:"limit"`
+	// Certificates already charged to this registered domain inside `window`, INCLUDING the
+	// reservation this deferral is for.
+	Used int64 `json:"used"`
+	// The trailing interval `used` was counted over. `168h` for the 7-day counter.
+	Window string `json:"window"`
+	// Extra preserves fields this build does not know about, so a newer
+	// writer's field survives an older reader's round trip.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
 // Operation
 type Operation struct {
 	Attempt     *int64  `json:"attempt,omitempty"`
 	CompletedAt *string `json:"completed_at,omitempty"`
 	CreatedAt   string  `json:"created_at"`
+	// The budget behind `deferral_reason`, when the deferral was a budget decision. `null` for a
+	// deferral that is not one — `rekey_awaiting_consumer_observation` waits on an observation,
+	// not on a counter.
+	DeferralBudget *RateLimitBudget `json:"deferral_budget,omitempty"`
 	// A taxonomy code, normally `acme_rate_limited`, `validation_budget_exhausted` or
 	// `rekey_awaiting_consumer_observation`.
 	DeferralReason *string         `json:"deferral_reason,omitempty"`
@@ -814,6 +898,9 @@ type OperationError struct {
 
 // OperationAccepted
 type OperationAccepted struct {
+	// Present on a DEFERRED `202`, so the client can fail fast (provider contract §7.1.6) without
+	// a second round trip to the operation record. `null` otherwise.
+	DeferralBudget *RateLimitBudget         `json:"deferral_budget,omitempty"`
 	EstimatedStart *string                  `json:"estimated_start,omitempty"`
 	OperationID    string                   `json:"operation_id"`
 	Registration   *CertificateRegistration `json:"registration,omitempty"`

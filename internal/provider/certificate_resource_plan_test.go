@@ -194,6 +194,157 @@ func TestModifyPlan_ReplacementWithDeletePolicyWarns(t *testing.T) {
 	}
 }
 
+// TestModifyPlan_PurgeProtectionIsAPlanTimeError is §5.4's purge-protection
+// validator, and it is the criterion `API-PROVIDER-VISIBILITY-FIELDS` was
+// opened to discharge.
+//
+// §5.4 has always said ERROR, and the provider shipped a warning because
+// nothing told it whether the vault was purge-protected: it links no Azure
+// control-plane SDK (§9.2) and no response carried the flag. Now
+// `NamespaceDetail.permitted_destinations[].purge_protection_enabled` does, and
+// the three answers are three different diagnostics — which is the point.
+// Collapsing "unknown" into "false" would silently switch the guard off for
+// exactly the destinations nobody described.
+func TestModifyPlan_PurgeProtectionIsAPlanTimeError(t *testing.T) {
+	ctx := context.Background()
+	enabled, disabled := true, false
+	retention := int64(90)
+
+	for _, tc := range []struct {
+		name        string
+		policies    []fakeservice.DestinationPolicy
+		ack         bool
+		wantError   bool
+		wantWarning bool
+	}{
+		{
+			name: "purge protected and unacknowledged is an error",
+			policies: []fakeservice.DestinationPolicy{{
+				ID: fakeservice.DefaultDestinationPolicyID, KeyVaultID: fakeservice.DefaultKeyVaultID,
+				PurgeProtectionEnabled: &enabled, SoftDeleteRetentionDays: &retention,
+			}},
+			wantError: true,
+		},
+		{
+			name: "the acknowledgement is what makes it legal",
+			policies: []fakeservice.DestinationPolicy{{
+				ID: fakeservice.DefaultDestinationPolicyID, KeyVaultID: fakeservice.DefaultKeyVaultID,
+				PurgeProtectionEnabled: &enabled, SoftDeleteRetentionDays: &retention,
+			}},
+			ack: true,
+		},
+		{
+			name: "known NOT purge protected is silent, not a quieter warning",
+			policies: []fakeservice.DestinationPolicy{{
+				ID: fakeservice.DefaultDestinationPolicyID, KeyVaultID: fakeservice.DefaultKeyVaultID,
+				PurgeProtectionEnabled: &disabled,
+			}},
+		},
+		{
+			name: "the vault match is canonical, not literal",
+			policies: []fakeservice.DestinationPolicy{{
+				ID: fakeservice.DefaultDestinationPolicyID,
+				// The SAME vault, spelled the way ARM sometimes returns it. A
+				// literal comparison would miss it and silently downgrade the
+				// error to a warning.
+				KeyVaultID:              strings.Replace(fakeservice.DefaultKeyVaultID, "/resourceGroups/", "/resourcegroups/", 1),
+				PurgeProtectionEnabled:  &enabled,
+				SoftDeleteRetentionDays: &retention,
+			}},
+			wantError: true,
+		},
+		{
+			name: "a service that does not report the flag still warns",
+			policies: []fakeservice.DestinationPolicy{{
+				ID: fakeservice.DefaultDestinationPolicyID, KeyVaultID: fakeservice.DefaultKeyVaultID,
+			}},
+			wantWarning: true,
+		},
+		{
+			name: "two grants naming the same vault are ambiguous, so it warns",
+			policies: []fakeservice.DestinationPolicy{
+				{ID: "a", KeyVaultID: fakeservice.DefaultKeyVaultID, PurgeProtectionEnabled: &enabled},
+				{ID: "b", KeyVaultID: fakeservice.DefaultKeyVaultID, PurgeProtectionEnabled: &disabled},
+			},
+			wantWarning: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policies := tc.policies
+			srv := fakeservice.New(t, func(o *fakeservice.Options) { o.DestinationPolicies = policies })
+			r := newTestResource(t, srv)
+
+			plan := planFor(t, ctx, func(m *certificateResourceModel) {
+				m.DeletionPolicy = types.StringValue("delete")
+				m.AcknowledgeIrreversibleDelete = types.BoolValue(tc.ack)
+			})
+			resp := &fwresource.ModifyPlanResponse{Plan: plan}
+			r.ModifyPlan(ctx, fwresource.ModifyPlanRequest{
+				State: emptyState(t, ctx), Plan: plan, Config: tfsdk.Config(plan),
+			}, resp)
+
+			errored := false
+			for _, d := range resp.Diagnostics.Errors() {
+				if strings.Contains(d.Summary(), "acknowledge_irreversible_delete") {
+					errored = true
+					if !strings.Contains(d.Detail(), "90 days") {
+						t.Errorf("the error must quote the retention the policy records; got:\n%s", d.Detail())
+					}
+					if !strings.Contains(d.Detail(), fakeservice.DefaultDestinationPolicyID) {
+						t.Errorf("the error must name the destination; got:\n%s", d.Detail())
+					}
+				}
+			}
+			warned := false
+			for _, d := range resp.Diagnostics.Warnings() {
+				if strings.Contains(d.Summary(), "may be irreversible") {
+					warned = true
+				}
+			}
+			if errored != tc.wantError {
+				t.Errorf("error = %v, want %v (diagnostics: %v)", errored, tc.wantError, resp.Diagnostics)
+			}
+			if warned != tc.wantWarning {
+				t.Errorf("warning = %v, want %v (diagnostics: %v)", warned, tc.wantWarning, resp.Diagnostics)
+			}
+			if tc.wantError && warned {
+				t.Error("the error and the warning are the same rule; only one may be raised")
+			}
+		})
+	}
+}
+
+// TestModifyPlan_PurgeProtectionIsNotRaisedForRetain keeps the rule scoped to
+// the policy it is about. `retain` never deletes the Key Vault certificate, so
+// purge protection is irrelevant to it and a diagnostic here would be noise on
+// every plan in every workspace that uses the default.
+func TestModifyPlan_PurgeProtectionIsNotRaisedForRetain(t *testing.T) {
+	ctx := context.Background()
+	enabled := true
+	srv := fakeservice.New(t, func(o *fakeservice.Options) {
+		o.DestinationPolicies = []fakeservice.DestinationPolicy{{
+			ID: fakeservice.DefaultDestinationPolicyID, KeyVaultID: fakeservice.DefaultKeyVaultID,
+			PurgeProtectionEnabled: &enabled,
+		}}
+	})
+	r := newTestResource(t, srv)
+
+	plan := planFor(t, ctx, nil) // deletion_policy defaults to "retain"
+	resp := &fwresource.ModifyPlanResponse{Plan: plan}
+	r.ModifyPlan(ctx, fwresource.ModifyPlanRequest{
+		State: emptyState(t, ctx), Plan: plan, Config: tfsdk.Config(plan),
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("retain must not raise the purge-protection error: %v", resp.Diagnostics)
+	}
+	for _, d := range resp.Diagnostics.Warnings() {
+		if strings.Contains(d.Summary(), "may be irreversible") {
+			t.Errorf("retain must not raise the purge-protection warning either; got %q", d.Summary())
+		}
+	}
+}
+
 // TestModifyPlan_MetadataOnlyChangeKeepsCurrentCertificateKnown is §6.3
 // refinement 2, and it is what stops a one-word description edit from rendering
 // six fields including `thumbprint_sha256` as `(known after apply)` — which to a

@@ -330,37 +330,32 @@ func (s *Server) representationLocked(reg *Registration) contracts.CertificateRe
 	}
 }
 
-// handleAction implements the action subset the tests need.
-func (s *Server) handleAction(w http.ResponseWriter, r *http.Request, namespace, name, action string) {
-	if r.Method != http.MethodPost {
-		s.problem(w, http.StatusMethodNotAllowed, contracts.CodeInvalidSpec)
+// handleForceRenew is the one action the fake models: the renewal that must NOT
+// produce a plan diff. The action set and the verb are the route table's answer
+// now (routes.gen.go), so this function no longer guesses at either — an action
+// the fake does not model reaches notImplemented and fails the test loudly
+// rather than answering a plausible 404.
+func (s *Server) handleForceRenew(w http.ResponseWriter, namespace, name string) {
+	s.SimulateRenewal(namespace, name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reg := s.registrations[key(namespace, name)]
+	if reg == nil {
+		RespondProblem(http.StatusNotFound, contracts.CodeRegistrationNotFound, s.opts.InstanceID)(w, nil)
 		return
 	}
-	switch action {
-	case "force-renew":
-		s.SimulateRenewal(namespace, name)
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		reg := s.registrations[key(namespace, name)]
-		if reg == nil {
-			RespondProblem(http.StatusNotFound, contracts.CodeRegistrationNotFound, s.opts.InstanceID)(w, nil)
-			return
-		}
-		op := s.startOperationLocked(reg, contracts.OperationTypeRenew)
-		op.op.State = contracts.OperationStateSucceeded
-		reg.Status.Phase = "ready"
-		reg.Status.Operation = &contracts.OperationSummary{
-			ID: &op.op.ID, Type: &op.op.Type,
-			State: contracts.RegistrationOperationStateSucceeded,
-			Phase: ptr(contracts.OperationPhaseDone),
-		}
-		writeJSON(w, http.StatusAccepted, contracts.OperationAccepted{
-			OperationID: op.op.ID, RegistrationID: reg.RegistrationID, Status: "accepted",
-			TargetGeneration: reg.Spec.Generation,
-		}, map[string]string{"Operation-Location": "/v1/operations/" + op.op.ID, "Retry-After": "1"})
-	default:
-		s.problem(w, http.StatusNotFound, contracts.CodeOperationNotPermitted)
+	op := s.startOperationLocked(reg, contracts.OperationTypeRenew)
+	op.op.State = contracts.OperationStateSucceeded
+	reg.Status.Phase = "ready"
+	reg.Status.Operation = &contracts.OperationSummary{
+		ID: &op.op.ID, Type: &op.op.Type,
+		State: contracts.RegistrationOperationStateSucceeded,
+		Phase: ptr(contracts.OperationPhaseDone),
 	}
+	writeJSON(w, http.StatusAccepted, contracts.OperationAccepted{
+		OperationID: op.op.ID, RegistrationID: reg.RegistrationID, Status: "accepted",
+		TargetGeneration: reg.Spec.Generation,
+	}, map[string]string{"Operation-Location": "/v1/operations/" + op.op.ID, "Retry-After": "1"})
 }
 
 // ------------------------------------------------------------------- helpers
@@ -380,8 +375,19 @@ func vaultNameFromID(id string) string {
 	return segs[len(segs)-1]
 }
 
+// hashHex is the fake's synthetic-value generator: a deterministic 64-character
+// hex string derived from a label and a monotonic seed, used for the thumbprints
+// and serial numbers a real CA would supply. It is NOT the destinationHash, which
+// the fake takes from primitives.DestinationHash in refreshResolvedLocked.
+//
+// THE SEPARATOR IS DELIBERATELY NOT "|". "|" is the destinationHash separator
+// fixed by contracts/primitives/primitives.yaml, and a sha256 joined by it is
+// what contracts/tools/check_single_definition.py greps for -- correctly, because
+// a second destinationHash is how the provider and the service stop agreeing
+// (F-092). Reusing that separator here made an unrelated fake helper read as a
+// restatement of the ownership hash, to the grep and to a human alike.
 func hashHex(prefix, seed string) string {
-	sum := sha256.Sum256([]byte(prefix + "|" + seed))
+	sum := sha256.Sum256([]byte(prefix + "\x1f" + seed))
 	return hex.EncodeToString(sum[:])
 }
 

@@ -1,0 +1,47 @@
+---
+page_title: "{{.ProviderShortName}} Provider"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{ .RenderedProviderName }} Provider
+
+{{ .Description | trimspace }}
+
+Read that second sentence twice before reading anything else. Terraform manages the *instruction*;
+the service continuously fulfils it — issuing, renewing and republishing into your Key Vault — even
+when Terraform has not run for months. Nearly every surprising behaviour in this provider follows
+from that split: `terraform plan` reports no change the day after a renewal, `id` never contains a
+version or a thumbprint, and destroying the resource destroys the instruction rather than,
+necessarily, the certificate.
+
+## Start here
+
+| Guide | Read it when |
+|---|---|
+| [Quickstart](guides/quickstart) | **First.** Your first certificate in six concepts, and how to discover every value without asking a human. |
+| [Two-stage bootstrap](guides/two-stage-bootstrap) | Before you write the `provider` block. Why the service and its certificates cannot share a configuration, and where the API's own endpoint certificate comes from. |
+| [Waiting, timeouts and recovery](guides/waiting-timeouts-and-recovery) | Before your first timeout, not after it. `TF_LOG=info`, the `terraform untaint` recovery command, and rate-limit deferral. |
+| [Consumer integration](guides/consumer-integration) | Before you bind anything. One row per consumer: URI form, identity, Key Vault role, pickup window, and the symptom when it breaks. |
+| [Destroy and decommission](guides/destroy-and-decommission) | Before you point a destroy/recreate CI loop at a production-shaped vault. |
+| [Destination-change migration](guides/destination-change-migration) | The moment you consider editing `key_vault_id`. It is a plan-time error, and this is the supported route. |
+| [Error reference](guides/error-reference) | Whenever anything fails. Every code, with who can act on it and what to do next. Generated from the service's own taxonomy. |
+| [Version compatibility and upgrade policy](guides/version-compatibility) | When planning a provider, service or module upgrade — and before any blue/green service cutover. |
+| [Security note for a destination vault owner](guides/destination-vault-security) | When you are asked to grant `Key Vault Certificates Officer` on a vault you own. |
+| [Saved-plan secret hygiene](guides/saved-plan-hygiene) | When wiring this provider into CI that archives `terraform plan -out`. |
+| [What this product does not do](guides/what-this-product-does-not-do) | Before you commit to it. The honest limits, including Certificate Transparency and private DNS. |
+
+{{ if .HasExample -}}
+## Example Usage
+
+{{ tffile .ExampleFile }}
+{{- end }}
+
+~> **Never obtain the publishing identity by reading the platform workspace's state.** A
+remote-state data source pointed at that state grants the reading workspace access to its storage
+account keys and its full resource graph — a privilege escalation dressed as convenience.
+`data.azureacme_service.this.publisher_principal_id` exists so the secure path is also the short
+one.
+
+{{ .SchemaMarkdown | trimspace }}

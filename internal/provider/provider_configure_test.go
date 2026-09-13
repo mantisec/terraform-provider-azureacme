@@ -85,6 +85,14 @@ func nullProviderModel(t *testing.T) Model {
 
 func configureWith(t *testing.T, m Model, tokens client.TokenSource) *fwprovider.ConfigureResponse {
 	t.Helper()
+	// Credential SELECTION reads the environment (§2.4), so a contributor's own
+	// exported `ARM_*` or `MANTISEC_ACME_TOKEN` would otherwise decide which
+	// method these tests resolve — and, since a second configured method is a
+	// rule-1 ERROR, could fail a test that says nothing about credentials.
+	// `ARM_CLIENT_SECRET` is deliberately NOT cleared: one test sets it.
+	for _, k := range credentialEnvVars {
+		t.Setenv(k, "")
+	}
 	ctx := context.Background()
 	s := providerSchema(t).Schema
 	cfg := providerConfigFrom(t, ctx, s, m)

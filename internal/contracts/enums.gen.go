@@ -5,7 +5,11 @@
 
 package contracts
 
-// OperationType
+// OperationType -- RESPONSE-ONLY. No request body carries an `OperationType`, so adding a
+// member is ADDITIVE under spec section 2.1 ("new enum values in response-only positions") and
+// needs no `/v2`: a client meeting an unknown value renders it verbatim. `rekey` was added on
+// exactly those terms — the handler previously emitted `renew`, which lost the distinction an
+// operator needs during a key-compromise incident (spec section 4.6.1).
 //
 // A client meeting an UNKNOWN value renders it verbatim and MUST NOT panic or
 // map it to a default that changes behaviour.
@@ -20,6 +24,7 @@ const (
 	OperationTypeAdopt   OperationType = "adopt"
 	OperationTypeRevoke  OperationType = "revoke"
 	OperationTypeRecover OperationType = "recover"
+	OperationTypeRekey   OperationType = "rekey"
 )
 
 // AllOperationTypeValues lists every value known to this build.
@@ -32,6 +37,7 @@ var AllOperationTypeValues = []OperationType{
 	OperationTypeAdopt,
 	OperationTypeRevoke,
 	OperationTypeRecover,
+	OperationTypeRekey,
 }
 
 // OperationState -- A client meeting an UNKNOWN state renders it verbatim and MUST NOT panic or

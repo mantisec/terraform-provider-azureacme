@@ -195,6 +195,106 @@ func TestCreate_DeferredBeyondTheTimeoutFailsFast(t *testing.T) {
 	}
 }
 
+// TestCreate_DeferralDiagnosticNamesTheBudgetByValue is §7.1.6's other half,
+// closed by `API-PROVIDER-VISIBILITY-FIELDS`.
+//
+// §7.1.6's example text quotes "46 of its 50 weekly certificates". The provider
+// holds no ledger and cannot compute either number, so until the `202` carried
+// `deferral_budget` the diagnostic could name the reset time and nothing else —
+// and "queued behind a rate limit until Friday" reads as a service fault, which
+// sends the operator to raise a support ticket rather than to stage the rollout.
+func TestCreate_DeferralDiagnosticNamesTheBudgetByValue(t *testing.T) {
+	ctx := context.Background()
+	srv := fakeservice.New(t)
+	resetAt := time.Now().UTC().Add(5 * 24 * time.Hour)
+	srv.SetBehaviour(fakeservice.Behaviour{
+		DeferOperation:      true,
+		DeferEstimatedStart: resetAt,
+		DeferBudget:         &contracts.RateLimitBudget{Used: 46, Limit: 40, Window: "168h"},
+	})
+	r := newTestResource(t, srv)
+
+	plan := planFor(t, ctx, func(m *certificateResourceModel) {
+		m.Timeouts = timeoutsObject(t, ctx, "60m", "", "", "")
+	})
+	resp := &fwresource.CreateResponse{State: emptyState(t, ctx)}
+	r.Create(ctx, fwresource.CreateRequest{Plan: plan}, resp)
+
+	detail := ""
+	for _, d := range resp.Diagnostics.Errors() {
+		if strings.Contains(d.Summary(), DiagCreateDeferredBeyondTimeout) {
+			detail = d.Detail()
+		}
+	}
+	if detail == "" {
+		t.Fatalf("expected a %s diagnostic; got %v", DiagCreateDeferredBeyondTimeout, resp.Diagnostics)
+	}
+	// The three values, by value. "46 used of 40 permitted per 7 days."
+	for _, want := range []string{"46", "40", "7 days"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("the diagnostic must name the budget by value (missing %q); got:\n%s", want, detail)
+		}
+	}
+	// And it must say WHICH limit, because 40 is not the number the certificate
+	// authority publishes and an operator comparing them will otherwise conclude
+	// the service is wrong.
+	if !strings.Contains(detail, "EFFECTIVE limit") {
+		t.Errorf("the diagnostic must say the limit is the effective one, not the CA's headline; got:\n%s", detail)
+	}
+}
+
+// TestCreate_DeferralDiagnosticOmitsAnAbsentBudget is the §2.1 half: a service
+// that predates `deferral_budget` still gets a fail-fast diagnostic, and it must
+// not contain a rendered nil.
+func TestCreate_DeferralDiagnosticOmitsAnAbsentBudget(t *testing.T) {
+	ctx := context.Background()
+	srv := fakeservice.New(t)
+	resetAt := time.Now().UTC().Add(5 * 24 * time.Hour)
+	srv.SetBehaviour(fakeservice.Behaviour{DeferOperation: true, DeferEstimatedStart: resetAt})
+	r := newTestResource(t, srv)
+
+	plan := planFor(t, ctx, func(m *certificateResourceModel) {
+		m.Timeouts = timeoutsObject(t, ctx, "60m", "", "", "")
+	})
+	resp := &fwresource.CreateResponse{State: emptyState(t, ctx)}
+	r.Create(ctx, fwresource.CreateRequest{Plan: plan}, resp)
+
+	detail := ""
+	for _, d := range resp.Diagnostics.Errors() {
+		if strings.Contains(d.Summary(), DiagCreateDeferredBeyondTimeout) {
+			detail = d.Detail()
+		}
+	}
+	if detail == "" {
+		t.Fatalf("expected a %s diagnostic; got %v", DiagCreateDeferredBeyondTimeout, resp.Diagnostics)
+	}
+	if strings.Contains(detail, "Registered-domain budget") {
+		t.Errorf("no budget was reported, so no budget sentence may be printed; got:\n%s", detail)
+	}
+}
+
+// TestHumaniseWindow pins the one piece of arithmetic in the budget sentence.
+//
+// The wire carries a Go duration and the certificate authority publishes days.
+// A window that is not a whole number of days is printed VERBATIM rather than
+// rounded: rounding would make "46 of 40 per 7 days" a statement about a window
+// the service did not use.
+func TestHumaniseWindow(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"168h", "7 days"},
+		{"24h", "1 day"},
+		{"720h", "30 days"},
+		{"3h", "3h"},
+		{"90m", "90m"},
+		{"", ""},
+		{"P7D", "P7D"},
+	} {
+		if got := humaniseWindow(tc.in); got != tc.want {
+			t.Errorf("humaniseWindow(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestCreate_WaitForAcceptedWithholdsTheURIs is §7.1.5.
 //
 // The versionless secret URI is VALID BUT EMPTY until a version exists, so

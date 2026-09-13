@@ -2,10 +2,12 @@ package provider
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -35,6 +37,197 @@ func TestModulePathIsMirrorRepository(t *testing.T) {
 	if got := string(m[1]); got == "mantisec-acmebot" || filepath.Base(got) != "terraform-provider-azureacme" {
 		t.Fatalf("module path %q does not end in the mirror repository name", got)
 	}
+}
+
+// TestDeveloperToolsArePinnedInGoSum is SCAFFOLD-PROVIDER-MODULE's pinning
+// check: `go.sum` pins tfplugindocs, and every generator this module shells out
+// to is pinned the same way — by a blank import in `tools/tools.go`.
+//
+// contracts-and-codegen.md §4.3: "Generator versions are pinned — Go via
+// `tools/tools.go` and `go.sum`, Python via `requirements-dev.txt` with hashes.
+// An unpinned generator turns a dependency update into a silent contract
+// change." A `go run <tool>@latest` resolves to a different generator on a
+// different day, and the drift check then reports a contract change nobody made.
+//
+// THE CONTRACT GENERATORS ARE PYTHON. `contracts/tools/generate.py` emits this
+// module's `internal/contracts/` package, so the Go-side set of contract
+// generators is empty today and `tools/tools.go` pins tfplugindocs alone. That
+// is a reason to assert the emptiness, not to skip the check: the second half
+// below fails on any `go:generate` directive in this module that runs a package
+// `tools/tools.go` does not pin, so the day a Go generator arrives unpinned,
+// this test is what says so.
+func TestDeveloperToolsArePinnedInGoSum(t *testing.T) {
+	tools := readRepoFile(t, filepath.Join("tools", "tools.go"))
+
+	// The build tag is what keeps a documentation generator out of `go build`,
+	// `go vet` and the Azure data-plane guard's `go list -deps` view.
+	if !strings.Contains(tools, "//go:build tools") {
+		t.Error("tools/tools.go has no `//go:build tools` constraint, so its imports enter the " +
+			"shipped dependency graph and dependency_guard_test.go starts judging a " +
+			"documentation generator's transitive dependencies")
+	}
+
+	blankImport := regexp.MustCompile(`(?m)^\s*_\s+"([^"]+)"`)
+	var pinned []string
+	for _, m := range blankImport.FindAllStringSubmatch(tools, -1) {
+		pinned = append(pinned, m[1])
+	}
+	if len(pinned) == 0 {
+		t.Fatal("tools/tools.go blank-imports nothing, so it pins nothing and this check is vacuous")
+	}
+
+	const tfplugindocs = "github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs"
+	if !containsString(pinned, tfplugindocs) {
+		t.Errorf("tools/tools.go does not blank-import %q. `make provider-docs` runs it, and an "+
+			"unpinned tfplugindocs emits different bytes for different contributors, which turns "+
+			"the docs drift check in provider-ci.yml into a coin toss.", tfplugindocs)
+	}
+
+	requires := moduleRequirements(t)
+	sum := readRepoFile(t, "go.sum")
+	for _, importPath := range pinned {
+		module, version := owningModule(requires, importPath)
+		if module == "" {
+			t.Errorf("tools/tools.go imports %q but go.mod requires no module providing it, "+
+				"so nothing pins its version", importPath)
+			continue
+		}
+		// Both lines matter: the `h1:` hash pins the module's content, the
+		// `/go.mod h1:` hash pins the graph it drags in.
+		for _, want := range []string{
+			module + " " + version + " h1:",
+			module + " " + version + "/go.mod h1:",
+		} {
+			if !strings.Contains(sum, want) {
+				t.Errorf("go.sum carries no %q line, so %s is required but not pinned by hash",
+					want, importPath)
+			}
+		}
+	}
+
+	// No generate directive may run a generator `tools/tools.go` does not pin.
+	// The module declares none today; this walk is what keeps that a fact rather
+	// than an assumption.
+	//
+	// The needle is ASSEMBLED, so this file — which has to name the directive in
+	// order to report it — is not itself a match. Same discipline, and the same
+	// reason, as .github/scripts/check_workflow_hygiene.py: a check that has to
+	// exempt itself has started to stop covering itself.
+	const generateDirective = "//go:" + "generate"
+	root := filepath.Dir(repoRelative(t, "go.mod"))
+	directive := regexp.MustCompile(regexp.QuoteMeta(generateDirective) + `\s+(.*)`)
+	scanned := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			// `dist/` is GoReleaser output and is git-ignored; the rest hold no Go.
+			switch d.Name() {
+			case ".git", "dist":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			rel = path
+		}
+		for _, m := range directive.FindAllStringSubmatch(string(b), -1) {
+			cmd := strings.TrimSpace(m[1])
+			if !runsAPinnedTool(cmd, pinned) {
+				t.Errorf("%s carries `%s %s`, which does not run a package pinned in "+
+					"tools/tools.go. An unpinned generator resolves differently on a different "+
+					"day and the contract drift check then reports a change nobody made "+
+					"(contracts-and-codegen.md §4.3).", rel, generateDirective, cmd)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the module for go:generate directives: %v", err)
+	}
+	if scanned < 10 {
+		t.Fatalf("only %d .go file(s) were scanned for go:generate directives, so the walk is "+
+			"not looking at this module", scanned)
+	}
+}
+
+// runsAPinnedTool reports whether a generate-directive command line invokes a
+// package that tools/tools.go pins. `go run <pkg>@<version>` is deliberately NOT
+// pinned: that form bypasses go.mod entirely, so go.sum never sees the tool.
+func runsAPinnedTool(cmd string, pinned []string) bool {
+	fields := strings.Fields(cmd)
+	if len(fields) < 3 || fields[0] != "go" || fields[1] != "run" {
+		return false
+	}
+	pkg := fields[2]
+	if strings.Contains(pkg, "@") {
+		return false
+	}
+	return containsString(pinned, pkg)
+}
+
+// moduleRequirements returns go.mod's `require` graph as module path → version,
+// covering both the block form and the single-line form.
+func moduleRequirements(t *testing.T) map[string]string {
+	t.Helper()
+	reqs := map[string]string{}
+	inBlock := false
+	for _, line := range strings.Split(readRepoFile(t, "go.mod"), "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "require (" {
+			inBlock = true
+			continue
+		}
+		if inBlock && line == ")" {
+			inBlock = false
+			continue
+		}
+		fields := strings.Fields(line)
+		if inBlock {
+			if len(fields) == 2 && strings.HasPrefix(fields[1], "v") {
+				reqs[fields[0]] = fields[1]
+			}
+			continue
+		}
+		if len(fields) == 3 && fields[0] == "require" && strings.HasPrefix(fields[2], "v") {
+			reqs[fields[1]] = fields[2]
+		}
+	}
+	if len(reqs) == 0 {
+		t.Fatal("go.mod declares no requirements, so the pinning check would pass vacuously")
+	}
+	return reqs
+}
+
+// owningModule finds the longest required module path that is a prefix of an
+// import path — `.../terraform-plugin-docs/cmd/tfplugindocs` is provided by the
+// module `.../terraform-plugin-docs`.
+func owningModule(requires map[string]string, importPath string) (string, string) {
+	best := ""
+	for module := range requires {
+		if importPath == module || strings.HasPrefix(importPath, module+"/") {
+			if len(module) > len(best) {
+				best = module
+			}
+		}
+	}
+	if best == "" {
+		return "", ""
+	}
+	return best, requires[best]
 }
 
 // TestProviderTypeNameIsOneWayDoor pins the provider address's second segment,

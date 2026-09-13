@@ -5,6 +5,8 @@
 
 package contracts
 
+import "encoding/json"
+
 // Kind identifies a catalogue document type. Every document carries schemaVersion and
 // minReaderVersion; readers fail CLOSED when minReaderVersion exceeds what this build
 // supports. A reader that guesses is worse than a reader that stops.
@@ -17,6 +19,7 @@ const (
 	KindCertificateRegistrationSpec   Kind = "CertificateRegistrationSpec"
 	KindCertificateRegistrationStatus Kind = "CertificateRegistrationStatus"
 	KindDestinationOwnership          Kind = "DestinationOwnership"
+	KindDnsNameClaim                  Kind = "DnsNameClaim"
 	KindNameClaim                     Kind = "NameClaim"
 	KindOperation                     Kind = "Operation"
 	KindServiceInstance               Kind = "ServiceInstance"
@@ -31,6 +34,7 @@ var AllKinds = []Kind{
 	KindCertificateRegistrationSpec,
 	KindCertificateRegistrationStatus,
 	KindDestinationOwnership,
+	KindDnsNameClaim,
 	KindNameClaim,
 	KindOperation,
 	KindServiceInstance,
@@ -45,8 +49,72 @@ var SchemaIDs = map[Kind]string{
 	KindCertificateRegistrationSpec:   "https://mantisec.dev/acme/contracts/catalogue/certificate-registration-spec.schema.json",
 	KindCertificateRegistrationStatus: "https://mantisec.dev/acme/contracts/catalogue/certificate-registration-status.schema.json",
 	KindDestinationOwnership:          "https://mantisec.dev/acme/contracts/catalogue/destination-ownership.schema.json",
+	KindDnsNameClaim:                  "https://mantisec.dev/acme/contracts/catalogue/dns-name-claim.schema.json",
 	KindNameClaim:                     "https://mantisec.dev/acme/contracts/catalogue/name-claim.schema.json",
 	KindOperation:                     "https://mantisec.dev/acme/contracts/catalogue/operation.schema.json",
 	KindServiceInstance:               "https://mantisec.dev/acme/contracts/catalogue/service-instance.schema.json",
 	KindTombstone:                     "https://mantisec.dev/acme/contracts/catalogue/tombstone.schema.json",
+}
+
+// Document is the catalogue envelope -- the three members every catalogue document carries --
+// plus a verbatim copy of every other member of the document.
+//
+// UNKNOWN FIELDS SURVIVE THE ROUND TRIP. A newer writer's field must come back out of an older
+// reader unchanged, which is what makes the two-phase catalogue migration safe: the release that
+// reads the new shape ships before the release that writes it, and it must not strip what it
+// does not recognise.
+//
+// Kind is deliberately not validated here. A document written by a newer service version may
+// carry a kind this build has never heard of, and a reader that refuses to parse it cannot
+// preserve it either.
+type Document struct {
+	SchemaVersion    int64 `json:"schemaVersion"`
+	MinReaderVersion int64 `json:"minReaderVersion"`
+	Kind             Kind  `json:"kind"`
+
+	// Extra holds every member this build does not know about, verbatim.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// EnvelopeFields are the members Document names. Everything else in a document lands in Extra.
+var EnvelopeFields = []string{"schemaVersion", "minReaderVersion", "kind"}
+
+// UnmarshalJSON fills the envelope and parks every other member in Extra.
+func (d *Document) UnmarshalJSON(data []byte) error {
+	type envelope Document
+	var known envelope
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for _, name := range EnvelopeFields {
+		delete(all, name)
+	}
+	*d = Document(known)
+	d.Extra = all
+	return nil
+}
+
+// MarshalJSON writes the envelope back out with every preserved member beside it.
+func (d Document) MarshalJSON() ([]byte, error) {
+	type envelope Document
+	encoded, err := json.Marshal(envelope(d))
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]json.RawMessage, len(d.Extra)+len(EnvelopeFields))
+	for name, value := range d.Extra {
+		out[name] = value
+	}
+	var known map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &known); err != nil {
+		return nil, err
+	}
+	for name, value := range known {
+		out[name] = value
+	}
+	return json.Marshal(out)
 }
